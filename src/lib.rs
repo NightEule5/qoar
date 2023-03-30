@@ -16,13 +16,12 @@
 
 #![allow(incomplete_features)]
 #![feature(generic_const_exprs)]
-#![feature(iter_array_chunks)]
-#![feature(buf_read_has_data_left)]
-#![feature(array_windows)]
 
-use std::{error, fmt, io, mem};
-use std::fmt::{Debug, Formatter, write};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::{error, io, mem};
+use std::cmp::max;
+use std::fmt::Debug;
+use std::io::Write;
+use amplify_derive::Display;
 
 #[cfg(test)]
 mod test;
@@ -31,117 +30,49 @@ mod test;
 
 type Result<T = (), E = Error> = std::result::Result<T, E>;
 
-#[derive(Clone, Debug)]
-pub enum ErrorKind {
-	InvalidRate(usize),
-	Exhausted,
-	UnknownMagic([u8; 4]),
-	IO,
-	SampleRead,
-	ChannelCountRead,
+#[derive(Debug, Display)]
+pub enum Error {
+	#[display("sample rate {0} is outside the range the supported range, [1,2^24)")]
+	UnsupportedRate(u32),
+	#[display(
+		"QOA streams must have at least one channel; use StreamingEncoder when the \
+		channel structure of the stream is unknown"
+	)]
+	ZeroChannels,
+	#[display(
+		"QOA streams must have at least one sample; use StreamingEncoder when the \
+		stream length is unknown"
+	)]
+	ZeroSamples,
+	#[display("stream layout cannot be set in a fixed encoder")]
+	LayoutSet,
+	#[display("could not {0}")]
+	Write(WriteKind, io::Error),
+	#[display("incomplete stream; {0} bytes expected, but stream ended")]
+	Incomplete(usize),
 }
 
-#[derive(Debug)]
-pub struct Error {
-	message: Option<String>,
-	kind: ErrorKind,
-	source: Option<Box<dyn error::Error>>,
-}
-
-impl fmt::Display for ErrorKind {
-	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::InvalidRate(rate) => write!(f, "invalid rate ({rate}), must be [1,16777215]"),
-			Self::Exhausted => write!(f, "buffer exhausted"),
-			Self::UnknownMagic(magic) => write!(f, "unknown magic ({magic:?})"),
-			Self::IO => write!(f, "IO error"),
-			Self::SampleRead => write!(f, "could not read sample"),
-			Self::ChannelCountRead => write!(
-				f,
-				"no fixed channel count was specified, and could not read channel \
-				count for current frame"
-			),
-		}
-	}
-}
-
-impl Error {
-	fn new(message: Option<String>, kind: ErrorKind, source: Option<Box<dyn error::Error>>) -> Self {
-		Self {
-			message,
-			kind,
-			source,
-		}
-	}
-
-	fn add_msg<M: ToString>(mut self, message: M) -> Self {
-		let _ = self.message.insert(message.to_string());
-		self
-	}
-
-	fn add_write_msg(mut self, data_type: &str, data_field: &str) -> Error {
-		self.add_msg(format!("could not write {data_type} ({data_field})"))
-	}
-}
-
-impl fmt::Display for Error {
-	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-		if let Some(ref message) = self.message {
-			write!(f, "{message}: {}", self.kind)
-		} else {
-			write!(f, "{}", self.kind)
-		}
-	}
+#[derive(Clone, Debug, Display)]
+pub enum WriteKind {
+	#[display("write file header ({0})")]
+	FileHeader(&'static str),
+	#[display("write frame header ({0})")]
+	FrameHeader(&'static str),
+	#[display("write lms state ({0})")]
+	LmsState(&'static str),
+	#[display("write slice data on channel {0}")]
+	SliceData(u8),
+	#[display("flush the sink")]
+	Flush,
 }
 
 impl error::Error for Error {
 	fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-		self.source.as_deref()
-	}
-}
-
-impl From<io::Error> for Error {
-	fn from(value: io::Error) -> Self {
-		Self::new(None, ErrorKind::IO, Some(value.into()))
-	}
-}
-
-// Data
-
-#[derive(Copy, Clone)]
-struct QoaFileHeader {
-	magic: [u8; 4],
-	sample_count: u32,
-}
-
-impl QoaFileHeader {
-	const MAGIC: [u8; 4] = *b"qoaf";
-
-	fn new(sample_count: u32) -> Self {
-		Self {
-			magic: Self::MAGIC,
-			sample_count,
+		match self {
+			Self::Write(_, err) => Some(err),
+			_ => None
 		}
 	}
-
-	fn check_magic(&self) -> Result {
-		if self.magic == Self::MAGIC {
-			Ok(())
-		} else {
-			Err(Error::new(None, ErrorKind::UnknownMagic(self.magic), None))
-		}
-	}
-}
-
-#[allow(non_camel_case_types)]
-type u24 = [u8; 3];
-
-#[derive(Copy, Clone)]
-struct QoaFrameHeader {
-	channel_count: u8,
-	sample_rate: u32,
-	sample_count: u16,
-	size: u16,
 }
 
 #[derive(Copy, Clone)]
@@ -150,107 +81,131 @@ struct QoaLmsState {
 	weights: [i16; 4],
 }
 
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct QoaSlice {
-	quant: u8,
-	data: [u8; 20],
-}
-
-impl QoaSlice {
-	const QMASK: u8 = 0xF;
-	const DMASK: u8 = 0b111;
-
-	pub fn pack(&self) -> u64 {
-		let Self { quant, data } = self;
-
-		let mut value = (*quant as u64) << 60;
-		for i in 0..20 {
-			value |= ((data[i] & Self::DMASK) as u64) << (19 - i) * 3;
-		}
-		value
-	}
-
-	pub fn unpack(&mut self, value: [u8; 8]) {
-		let Self { quant, data } = self;
-
-		let value = u64::from_be_bytes(value);
-
-		*quant = (value >> 60) as u8 & Self::QMASK;
-		for i in 0..20 {
-			data[i] = (value >> (19 - i) * 3) as u8 & Self::DMASK;
-		}
-	}
-}
-
-#[derive(Copy, Clone)]
-struct QoaChannelFrame {
-	lms_state: QoaLmsState,
-	slices: [QoaSlice; 256],
-}
-
-#[derive(Clone)]
-struct QoaFrame {
-	header: QoaFrameHeader,
-	channels: Vec<QoaChannelFrame>
-}
-
-#[derive(Copy, Clone)]
-enum ModeOptions {
-	Streaming,
-	Fixed(FixedOptions),
-}
-
 #[derive(Copy, Clone, Default)]
-struct FixedOptions {
+struct EncoderOptions {
 	sample_count: usize,
 	sample_rate: usize,
-	channel_count: u8,
+	channel_count: usize,
+	fixed: bool,
 }
 
-pub struct QoaEncoder<S: Pcm16Source> {
-	options: ModeOptions,
-	source: S,
+pub struct Encoder<S: Write> {
+	opt: EncoderOptions,
+	has_header: bool,
+	lms_states: Vec<QoaLmsState>,
+	sink: S,
+	closed: bool,
 }
 
-impl<S: Pcm16Source> QoaEncoder<S> {
-	pub fn new_streaming(source: S) -> Self {
-		Self {
-			options: ModeOptions::Streaming,
-			source
+// Todo: implement streaming mode by buffering data and encoding slice-wise, rather
+//  than frame-wise.
+impl<S: Write> Encoder<S> {
+	pub fn new(sample_count: u32, sample_rate: u32, channel_count: u8, sink: S) -> Result<Self> {
+		if  sample_count == 0 { return Err(Error::ZeroSamples ) }
+		if channel_count == 0 { return Err(Error::ZeroChannels) }
+		if !(1..=16777215).contains(&sample_rate) {
+			return Err(Error::UnsupportedRate(sample_rate))
 		}
+
+		Ok(Self {
+			opt: EncoderOptions {
+				sample_count: sample_count as usize,
+				sample_rate: sample_rate as usize,
+				channel_count: channel_count as usize,
+				fixed: true,
+			},
+			has_header: false,
+			lms_states: {
+				let mut lms = Vec::with_capacity(channel_count as usize);
+				lms.fill(QoaLmsState::default());
+				lms
+			},
+			sink,
+			closed: false,
+		})
 	}
 
-	/// Note: `sample_rate` cuts off the last 8 bits (u24).
-	pub fn new(
-		sample_count: usize,
-		sample_rate: usize,
-		channel_count: u8,
-		source: S
-	) -> Self {
-		let sample_rate = sample_rate & 0xFFF;
-		Self {
-			options: ModeOptions::Fixed(
-				FixedOptions {
-					sample_count,
-					sample_rate,
-					channel_count,
-				}
-			),
-			source,
-		}
+	fn samples(&self) -> usize { self.opt.sample_count }
+
+	fn consume_samples(&mut self, n: usize) -> usize {
+		let n = max(n, self.samples());
+		self.opt.sample_count -= n;
+		n
 	}
 
-	pub fn encode(&mut self, sink: &mut impl Write) -> Result {
-		let Self { options, source } = self;
-
-		if let ModeOptions::Fixed(
-			FixedOptions { sample_count, sample_rate, channel_count }
-		) = options {
-			enc(source, *channel_count, *sample_rate, *sample_count, sink)
-		} else {
-			todo!("Streaming mode is not yet supported");
+	/// Sets the `sample_rate` and `channel_count` of the encoder, flushing any
+	/// unwritten data from the old layout. Returns [`Error::LayoutSet`] is the
+	/// encoder is fixed.
+	pub fn set_layout(&mut self, sample_rate: u32, channel_count: u8) -> Result {
+		if self.opt.fixed {
+			return Err(Error::LayoutSet)
 		}
+
+		self.flush()?;
+		self.opt.sample_rate = sample_rate as usize;
+		self.opt.channel_count = channel_count as usize;
+
+		Ok(())
 	}
+
+	/// Returns the frame size, the number of sample that can fit in a frame. It's
+	/// recommended to keep sample slices at least this large until the end of the
+	/// stream, as each encode operation will write one frame.
+	pub fn frame_size(&self) -> usize {
+		FRAME_LEN * self.opt.channel_count as usize
+	}
+
+	/// Encodes a slice of `samples` into `sink`, returning the number of samples
+	/// encoded. All samples may not be consumed if: the samples written are equal
+	/// to the specified `sample_count`, or the sample slice is too large to fit in
+	/// one frame.
+	pub fn encode(&mut self, samples: &[i16]) -> Result<usize> {
+		let EncoderOptions { sample_count, sample_rate, channel_count, fixed } = self.opt;
+		let ref mut sink = self.sink;
+
+		if !self.has_header {
+			sink.enc_file_header(sample_count as u32)?;
+			self.has_header = true;
+		}
+
+		if fixed && sample_count == 0 { return Ok(0) }
+
+		let len = sink.enc_frame(samples, channel_count, sample_count, sample_rate, &mut self.lms_states)?;
+		Ok(self.consume_samples(len))
+	}
+
+	/// Flushes remaining buffered samples into an encoded frame, returning the
+	/// number of samples encoded. In streaming mode, incomplete frames will be
+	/// padded with silence, since the length of the frame was not known.
+	pub fn flush(&mut self) -> Result<usize> {
+		self.sink
+			.flush()
+			.map_err(|err| Error::Write(WriteKind::Flush, err))?;
+		Ok(0)
+	}
+
+	/// Flushes then closes the encoder, filling the rest of the expected length
+	/// with silence.
+	pub fn close(&mut self) -> Result {
+		if self.closed { return Ok(()) }
+		self.closed = true;
+
+		if self.samples() > 0 {
+			let mut silence = Vec::with_capacity(self.samples());
+			silence.fill(0);
+
+			while self.samples() > 0 {
+				self.encode(&silence)?;
+			}
+		}
+		self.flush()?;
+		Ok(())
+	}
+}
+
+impl<S: Write> Drop for Encoder<S> {
+	/// Closes the encoder.
+	fn drop(&mut self) { let _ = self.close(); }
 }
 
 // Codec
@@ -316,34 +271,129 @@ impl Int for u16 {
 }
 
 trait QoaSink: Write {
-	fn write_int<T: Int>(&mut self, value: T) -> Result where [u8; T::SIZE]: {
-		self.write_bytes(&value.into_bytes())
+	fn write_int<T: Int>(
+		&mut self,
+		value: T,
+		kind: impl FnOnce() -> WriteKind
+	) -> Result where [u8; T::SIZE]: {
+		self.write_bytes(&value.into_bytes(), kind)
 	}
 
-	fn write_byte(&mut self, value: u8) -> Result { self.write_bytes(&[value]) }
-
-	fn write_bytes(&mut self, value: &[u8]) -> Result {
-		self.write_all(value).map_err(Error::from)
+	fn write_byte(&mut self, value: u8, kind: impl FnOnce() -> WriteKind) -> Result {
+		self.write_bytes(&[value], kind)
 	}
 
-	fn write_file_header(&mut self, sample_count: u32) -> Result {
-		self.write_int(MAGIC)
-			.map_err(|err| err.add_write_msg("file header", "magic bytes"))?;
-		self.write_int(sample_count)
-			.map_err(|err| err.add_write_msg("file header", "sample count"))?;
+	fn write_bytes(&mut self, value: &[u8], kind: impl FnOnce() -> WriteKind) -> Result {
+		self.write_all(value).map_err(|err| Error::Write(kind(), err))
+	}
+
+	fn enc_file_header(&mut self, sample_count: u32) -> Result {
+		self.write_int(MAGIC,        || WriteKind::FileHeader("magic bytes"))?;
+		self.write_int(sample_count, || WriteKind::FileHeader("sample count"))
+	}
+
+	fn enc_frame_header(&mut self, channel_count: u8, sample_rate: u32, sample_count: u16, slice_count: usize) -> Result {
+		let size = 24 * channel_count as u16 + 8 * slice_count as u16 * channel_count as u16;
+		self.write_byte(channel_count, || WriteKind::FrameHeader("channel count"))?;
+		self.write_bytes(
+			&sample_rate.into_bytes()[1..], // Clip to 24-bits
+			|| WriteKind::FrameHeader("sample rate")
+		)?;
+		self.write_int(sample_count,   || WriteKind::FrameHeader("sample count"))?;
+		self.write_int(size,           || WriteKind::FrameHeader("size"))
+	}
+
+	fn enc_lms_state(&mut self, value: &QoaLmsState) -> Result {
+		let QoaLmsState { history, weights } = value;
+
+		fn pack(acc: u64, cur: &i16) -> u64 {
+			(acc << 16) | (*cur as u16 & 0xFFFF) as u64
+		}
+
+		let history = history.iter().fold(0, pack);
+		let weights = weights.iter().fold(0, pack);
+		self.write_int(history, || WriteKind::LmsState("history"))?;
+		self.write_int(weights, || WriteKind::LmsState("weights"))
+	}
+
+	fn enc_slices(&mut self, samples: &[i16], channel_count: usize, lms: &mut [QoaLmsState]) -> Result {
+		let mut samples = samples;
+		for chn in 0..channel_count {
+			let len = SLICE_LEN.clamp(0, samples.len());
+			let rng = 0..len * channel_count + chn;
+
+			let mut best_error = -1;
+			let mut best_slice = 0;
+			let mut best_lms = QoaLmsState::default();
+
+			for sf in 0..16 {
+				let mut cur_lms = lms[chn];
+				let mut slice = sf as u64;
+				let mut cur_err = 0;
+
+				for si in rng.clone().step_by(channel_count) {
+					let sample = samples[si];
+					let predicted = cur_lms.predict();
+					let residual = sample as i32 - predicted;
+					let scaled = div(residual, sf);
+					let clamped = scaled.clamp(-8, 8);
+					let quantized = QUANT_TABLE[(clamped + 8) as usize];
+					let dequantized = DEQUANT_TABLE[sf][quantized as usize];
+					let reconst = (predicted + dequantized).clamp(i16::MIN as i32, 32767) as i16;
+
+					let error = sample as i64 - reconst as i64;
+					cur_err += error * error;
+
+					if cur_err > best_error {
+						break;
+					}
+
+					cur_lms.update(reconst, dequantized);
+					slice = slice << 3 | quantized as u64;
+				}
+
+				if cur_err < best_error {
+					best_error = cur_err;
+					best_slice = slice;
+					best_lms = cur_lms;
+				}
+			}
+
+			lms[chn] = best_lms;
+			best_slice <<= (SLICE_LEN - len) * 3;
+			self.write_int(best_slice, || WriteKind::SliceData(chn as u8))?;
+
+			samples = &samples[rng.end..]
+		}
+
 		Ok(())
 	}
 
-	fn write_frame_header(&mut self, channel_count: u8, sample_rate: u32, sample_count: u16, size: u16) -> Result {
-		self.write_byte(channel_count)
-			.map_err(|err| err.add_write_msg("frame header", "channel count"))?;
-		self.write_bytes(&sample_rate.into_bytes()[1..]) // Clip to 24-bits
-			.map_err(|err| err.add_write_msg("frame header", "sample rate"))?;
-		self.write_int(sample_count)
-			.map_err(|err| err.add_write_msg("frame header", "sample count"))?;
-		self.write_int(size)
-			.map_err(|err| err.add_write_msg("frame header", "size"))?;
-		Ok(())
+	fn enc_frame(
+		&mut self,
+		samples: &[i16],
+		channel_count: usize,
+		sample_count: usize,
+		sample_rate: usize,
+		lms: &mut [QoaLmsState],
+	) -> Result<usize> {
+		let sample_count = FRAME_LEN.clamp(0, sample_count);
+		let len = sample_count * channel_count;
+		let slice_count = (len + SLICE_LEN - 1) / SLICE_LEN;
+		self.enc_frame_header(
+			channel_count as u8,
+			sample_rate as u32,
+			sample_count as u16,
+			slice_count
+		)?;
+
+		for lms in lms.iter() { self.enc_lms_state(lms)? }
+
+		for slice in samples.windows(SLICE_LEN) {
+			self.enc_slices(slice, channel_count, lms)?;
+		}
+
+		Ok(len)
 	}
 }
 
@@ -369,22 +419,6 @@ impl QoaLmsState {
 		self.history.rotate_left(1);
 		self.history[3] = sample;
 	}
-
-	fn enc(self, sink: &mut impl QoaSink) -> Result {
-		let Self { history, weights } = self;
-
-		fn pack(acc: u64, cur: i16) -> u64 {
-			(acc << 16) | (cur as u16 & 0xFFFF) as u64
-		}
-
-		let history = history.into_iter().fold(0, pack);
-		let weights = weights.into_iter().fold(0, pack);
-		sink.write_int(history)
-			.map_err(|err| err.add_write_msg("lms state", "history"))?;
-		sink.write_int(weights)
-			.map_err(|err| err.add_write_msg("lms state", "weights"))?;
-		Ok(())
-	}
 }
 
 impl Default for QoaLmsState {
@@ -402,187 +436,4 @@ fn div(v: i32, sf: usize) -> i32 {
 	n += ((v > 0) as i32 - (v < 0) as i32) -
 		 ((n > 0) as i32 - (n < 0) as i32);
 	n
-}
-
-fn enc_frame(
-	samples: &[i16],
-	sample_rate: u32,
-	lms_states: &mut Vec<QoaLmsState>,
-	sink: &mut impl QoaSink,
-) -> Result {
-	let channel_count = lms_states.len() as u8;
-	let sample_count = samples.len() as u16;
-	let slices = (sample_count + SLICE_LEN as u16 - 1) / SLICE_LEN as u16;
-	let size = 24 * channel_count as u16 + 8 * slices * channel_count as u16;
-
-	sink.write_frame_header(channel_count, sample_rate, sample_count, size)?;
-	for lms in lms_states.iter() { lms.enc(sink)? }
-
-	for sample in (0..sample_count as usize).step_by(SLICE_LEN) {
-		for chn in 0..channel_count {
-			let slice_len = SLICE_LEN.clamp(0, sample_count as usize - sample);
-			let slice_range = {
-				let slice_start = sample * channel_count as usize + chn as usize;
-				let slice_end = (sample + slice_len) * channel_count as usize + chn as usize;
-
-				slice_start..slice_end
-			};
-
-			let mut best_error = -1;
-			let mut best_slice = 0;
-			let mut best_lms = QoaLmsState::default();
-
-			for sf in 0..16 {
-				let mut lms = lms_states[chn as usize];
-				let mut slice = sf as u64;
-				let mut cur_err = 0;
-
-				for si in slice_range.clone().step_by(channel_count as usize) {
-					let sample = samples[si];
-					let predicted = lms.predict();
-					let residual = sample as i32 - predicted;
-					let scaled = div(residual, sf);
-					let clamped = scaled.clamp(-8, 8);
-					let quantized = QUANT_TABLE[(clamped + 8) as usize];
-					let dequantized = DEQUANT_TABLE[sf][quantized as usize];
-					let reconst = (predicted + dequantized).clamp(i16::MIN as i32, 32767) as i16;
-
-					let error = sample as i64 - reconst as i64;
-					cur_err += error * error;
-
-					if cur_err > best_error {
-						break;
-					}
-
-					lms.update(reconst, dequantized);
-					slice = slice << 3 | quantized as u64;
-				}
-
-				if cur_err < best_error {
-					best_error = cur_err;
-					best_slice = slice;
-					best_lms = lms;
-				}
-			}
-
-			lms_states[chn as usize] = best_lms;
-
-			best_slice <<= (SLICE_LEN - slice_len) * 3;
-			sink.write_int(best_slice)
-				.map_err(|err|
-					err.add_msg(
-						format!("could not write slice on channel {chn}")
-					)
-				)?;
-		}
-	}
-	Ok(())
-}
-
-fn enc(
-	samples: &mut impl Pcm16Source,
-	channel_count: u8,
-	sample_rate: usize,
-	sample_count: usize,
-	sink: &mut impl Write
-) -> Result {
-	if !(1..=16777215).contains(&sample_rate) {
-		return Err(Error::new(None, ErrorKind::InvalidRate(sample_rate), None));
-	}
-
-	let mut lms = {
-		let mut channels = Vec::with_capacity(channel_count as usize);
-		channels.fill(QoaLmsState::default());
-		channels
-	};
-
-	sink.write_file_header(sample_count as u32)?;
-
-	// Streaming mode
-	let sample_count = if sample_count == 0 {
-		usize::MAX
-	} else {
-		sample_count
-	};
-	let var_channels = channel_count == 0;
-
-	let mut frame_buf = [0; FRAME_LEN];
-	while !samples.exhausted() {
-		let channel_count = if var_channels {
-			samples.channels()
-				.map_err(|err|
-					Error::new(None, ErrorKind::ChannelCountRead, Some(err.into()))
-				)?
-		} else {
-			channel_count
-		};
-
-		let mut frame_len = FRAME_LEN.clamp(0, sample_count) * channel_count as usize;
-		frame_len = samples.read_frame(&mut frame_buf[..frame_len])
-						   .map_err(|err|
-							   Error::new(
-								   None,
-								   ErrorKind::SampleRead,
-								   Some(err.into())
-							   )
-						   )?;
-		enc_frame(&frame_buf[..frame_len], sample_rate as u32, &mut lms, sink)?;
-	}
-	Ok(())
-}
-
-// IO
-
-/// A raw PCM-S16LE audio source.
-pub trait Pcm16Source {
-	type Error: error::Error + Into<Box<dyn error::Error>>;
-
-	/// Returns true if the source has no more samples.
-	fn exhausted(&mut self) -> Result<bool, Self::Error>;
-
-	/// Returns the number of channels the source has. Called before
-	/// [`Self::read_frame`] to size the sample buffer in streaming mode.
-	fn channels(&mut self) -> Result<u8, Self::Error>;
-
-	/// Reads a frame to `buf`, returning the number of samples read.
-	fn read_frame(&mut self, buf: &mut [i16]) -> Result<usize, Self::Error>;
-}
-
-pub struct Pcm16Reader<R: Read> {
-	channel_count: u8,
-	source: BufReader<R>,
-}
-
-impl<R: Read> Pcm16Reader<R> {
-	pub fn new(channel_count: u8, source: BufReader<R>) -> Self {
-		assert!(channel_count > 0);
-		Self {
-			channel_count,
-			source,
-		}
-	}
-}
-
-impl<R: Read> Pcm16Source for Pcm16Reader<R> {
-	type Error = Error;
-
-	fn exhausted(&mut self) -> Result<bool> {
-		Ok(!self.source.has_data_left().map_err(Error::from)?)
-	}
-
-	fn channels(&mut self) -> Result<u8> {
-		Ok(self.channel_count)
-	}
-
-	fn read_frame(&mut self, buf: &mut [i16]) -> Result<usize> {
-		const N: usize = mem::size_of::<i16>();
-		let mut bytes = Vec::with_capacity(buf.len() * N);
-		let count = self.source.read(&mut bytes).map_err(Error::from)?;
-		let samples: Vec<_> = bytes.array_windows::<N>()
-								   .take(count / N)
-								   .map(|sample| u16::from_be_bytes(*sample) as i16)
-								   .collect();
-		buf.copy_from_slice(&samples);
-		Ok(samples.len())
-	}
 }
