@@ -15,41 +15,39 @@
 //! See the draft spec: https://qoaformat.org/qoa-specification-draft-01.pdf
 
 #![allow(incomplete_features)]
-#![feature(generic_const_exprs)]
+#![feature(
+	buf_read_has_data_left,
+	generic_const_exprs,
+	never_type,
+)]
 
-use std::{error, io, mem};
-use std::cmp::max;
+use std::{error, io};
+use std::cmp::min;
 use std::fmt::Debug;
-use std::io::Write;
 use amplify_derive::Display;
 
-#[cfg(test)]
-mod test;
+pub use encoder::*;
+pub use pcm_io::*;
+
+mod pcm_io;
+mod encoder;
 
 // Error
 
-type Result<T = (), E = Error> = std::result::Result<T, E>;
+pub(crate) type Result<T = (), E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Display)]
 pub enum Error {
-	#[display("sample rate {0} is outside the range the supported range, [1,2^24)")]
-	UnsupportedRate(u32),
-	#[display(
-		"QOA streams must have at least one channel; use StreamingEncoder when the \
-		channel structure of the stream is unknown"
-	)]
-	ZeroChannels,
-	#[display(
-		"QOA streams must have at least one sample; use StreamingEncoder when the \
-		stream length is unknown"
-	)]
-	ZeroSamples,
-	#[display("stream layout cannot be set in a fixed encoder")]
-	LayoutSet,
+	#[display("invalid stream descriptor ({0}); use streaming mode if unknown")]
+	InvalidDescriptor(DescriptorError),
+	#[display("stream descriptor cannot be set in a fixed encoder")]
+	InvalidDescriptorChange,
+	#[display("could not read samples")]
+	SampleRead(Box<dyn error::Error>),
 	#[display("could not {0}")]
 	Write(WriteKind, io::Error),
-	#[display("incomplete stream; {0} bytes expected, but stream ended")]
-	Incomplete(usize),
+	#[display("closed")]
+	Closed,
 }
 
 #[derive(Clone, Debug, Display)]
@@ -69,8 +67,148 @@ pub enum WriteKind {
 impl error::Error for Error {
 	fn source(&self) -> Option<&(dyn error::Error + 'static)> {
 		match self {
+			Self::SampleRead(err) => Some(err.as_ref()),
 			Self::Write(_, err) => Some(err),
 			_ => None
+		}
+	}
+}
+
+#[derive(Copy, Clone, Debug, Display)]
+pub enum DescriptorError {
+	#[display("sample rate {0} is outside the range the accepted range, [1,2^24)")]
+	UnsupportedRate(u32),
+	#[display("QOA streams must have at least one channel")]
+	NoChannels,
+	#[display("QOA streams must have at least one sample")]
+	NoSamples,
+	#[display("QOA streams are limited to 255 channels, but was {0}")]
+	TooManyChannels(usize),
+	#[display("QOA streams are limited to 2^32-1 samples, but was {0}")]
+	TooManySamples(usize),
+}
+
+impl error::Error for DescriptorError { }
+
+#[derive(Copy, Clone, Default)]
+pub struct StreamDescriptor {
+	/// The number of samples per channel.
+	sample_count: Option<u32>,
+	/// The sample rate.
+	sample_rate: Option<u32>,
+	/// The number of channels.
+	channel_count: Option<u8>,
+	/// Whether the sample data is channel-interleaved.
+	interleaved: bool,
+}
+
+impl StreamDescriptor {
+	/// Creates a new stream descriptor. Fields can be omitted to infer with usage.
+	///
+	/// # Errors
+	///
+	/// [`DescriptorError::UnsupportedRate`]: `sample_rate` is outside the range
+	/// `[1,2^24)`.
+	///
+	/// [`DescriptorError::NoChannels`]: `channel_count` is `0`.
+	///
+	/// [`DescriptorError::NoSamples`]: `sample_count` is `0`.
+	fn new(
+		sample_count: Option<u32>,
+		sample_rate: Option<u32>,
+		channel_count: Option<u8>,
+		interleaved: bool,
+	) -> Result<Self, DescriptorError> {
+		if let Some(rate) = sample_rate {
+			if !(1..16777216).contains(&rate) {
+				return Err(DescriptorError::UnsupportedRate(rate))
+			}
+		}
+
+		if let Some(_s @ 0) = sample_count {
+			return Err(DescriptorError::NoSamples)
+		}
+
+		if let Some(_c @ 0) = channel_count {
+			return Err(DescriptorError::NoChannels)
+		}
+
+		Ok(Self {
+			sample_count,
+			sample_rate,
+			channel_count,
+			interleaved,
+		})
+	}
+
+	pub fn samples(&self) -> Option<u32> { self.sample_count }
+	pub fn rate(&self) -> Option<u32> { self.sample_rate }
+	pub fn channels(&self) -> Option<u8> { self.channel_count }
+
+	pub fn suggest_sample_count(&mut self, sample_count: u32) {
+		let samples = self.sample_count.get_or_insert(sample_count);
+		*samples = min(*samples, sample_count);
+	}
+
+	pub fn suggest_sample_rate(&mut self, sample_rate: u32) {
+		let _ = self.sample_rate.get_or_insert(sample_rate);
+	}
+
+	pub fn suggest_channel_count(&mut self, channel_count: u8) {
+		let _ = self.channel_count.get_or_insert(channel_count);
+	}
+	
+	fn is_streaming(&self) -> bool {
+		self.sample_count.is_none()
+	}
+
+	fn unwrap_all(self) -> (u32, u32, u8, bool) {
+		let Self { sample_count, sample_rate, channel_count, interleaved } = self;
+
+		(
+			sample_count .unwrap_or_default(),
+			sample_rate  .unwrap_or_default(),
+			channel_count.unwrap_or_default(),
+			interleaved
+		)
+	}
+
+	fn set<T: Copy>(option: &mut Option<T>, fallback: &Option<T>)  {
+		if option.is_none() {
+			if let Some(value) = fallback {
+				let _ = option.insert(*value);
+			}
+		}
+	}
+
+	pub(crate) fn infer_from_vec(&mut self, vec: &Vec<i16>, fallback: &Self) {
+		self.infer(fallback);
+
+		if let Some(samples) = self.sample_count.as_mut() {
+			// Infer channel count from sample count.
+			let _ = self.channel_count.get_or_insert_with(|| {
+				*samples = min(*samples, vec.len() as u32);
+				(vec.len() as u32 / *samples) as u8
+			});
+		} else if let Some(chn) = self.channel_count {
+			// Infer sample count from channel count.
+			let _ = self.sample_count.get_or_insert_with(||
+				vec.len() as u32 / chn as u32
+			);
+		}
+	}
+
+	pub(crate) fn infer(&mut self, fallback: &Self) {
+		Self::set(&mut self.sample_count,  &fallback.sample_count );
+		Self::set(&mut self.sample_rate,   &fallback.sample_rate  );
+		Self::set(&mut self.channel_count, &fallback.channel_count);
+
+		if let Some(_s @ 0) = self.sample_rate {
+			self.sample_rate = None;
+		}
+
+		if let Some(_c @ 0) = self.sample_rate {
+			self.channel_count = None;
 		}
 	}
 }
@@ -81,132 +219,7 @@ struct QoaLmsState {
 	weights: [i16; 4],
 }
 
-#[derive(Copy, Clone, Default)]
-struct EncoderOptions {
-	sample_count: usize,
-	sample_rate: usize,
-	channel_count: usize,
-	fixed: bool,
-}
-
-pub struct Encoder<S: Write> {
-	opt: EncoderOptions,
-	has_header: bool,
-	lms_states: Vec<QoaLmsState>,
-	sink: S,
-	closed: bool,
-}
-
-// Todo: implement streaming mode by buffering data and encoding slice-wise, rather
-//  than frame-wise.
-impl<S: Write> Encoder<S> {
-	pub fn new(sample_count: u32, sample_rate: u32, channel_count: u8, sink: S) -> Result<Self> {
-		if  sample_count == 0 { return Err(Error::ZeroSamples ) }
-		if channel_count == 0 { return Err(Error::ZeroChannels) }
-		if !(1..=16777215).contains(&sample_rate) {
-			return Err(Error::UnsupportedRate(sample_rate))
-		}
-
-		Ok(Self {
-			opt: EncoderOptions {
-				sample_count: sample_count as usize,
-				sample_rate: sample_rate as usize,
-				channel_count: channel_count as usize,
-				fixed: true,
-			},
-			has_header: false,
-			lms_states: {
-				let mut lms = Vec::with_capacity(channel_count as usize);
-				lms.fill(QoaLmsState::default());
-				lms
-			},
-			sink,
-			closed: false,
-		})
-	}
-
-	fn samples(&self) -> usize { self.opt.sample_count }
-
-	fn consume_samples(&mut self, n: usize) -> usize {
-		let n = max(n, self.samples());
-		self.opt.sample_count -= n;
-		n
-	}
-
-	/// Sets the `sample_rate` and `channel_count` of the encoder, flushing any
-	/// unwritten data from the old layout. Returns [`Error::LayoutSet`] is the
-	/// encoder is fixed.
-	pub fn set_layout(&mut self, sample_rate: u32, channel_count: u8) -> Result {
-		if self.opt.fixed {
-			return Err(Error::LayoutSet)
-		}
-
-		self.flush()?;
-		self.opt.sample_rate = sample_rate as usize;
-		self.opt.channel_count = channel_count as usize;
-
-		Ok(())
-	}
-
-	/// Returns the frame size, the number of sample that can fit in a frame. It's
-	/// recommended to keep sample slices at least this large until the end of the
-	/// stream, as each encode operation will write one frame.
-	pub fn frame_size(&self) -> usize {
-		FRAME_LEN * self.opt.channel_count as usize
-	}
-
-	/// Encodes a slice of `samples` into `sink`, returning the number of samples
-	/// encoded. All samples may not be consumed if: the samples written are equal
-	/// to the specified `sample_count`, or the sample slice is too large to fit in
-	/// one frame.
-	pub fn encode(&mut self, samples: &[i16]) -> Result<usize> {
-		let EncoderOptions { sample_count, sample_rate, channel_count, fixed } = self.opt;
-		let ref mut sink = self.sink;
-
-		if !self.has_header {
-			sink.enc_file_header(sample_count as u32)?;
-			self.has_header = true;
-		}
-
-		if fixed && sample_count == 0 { return Ok(0) }
-
-		let len = sink.enc_frame(samples, channel_count, sample_count, sample_rate, &mut self.lms_states)?;
-		Ok(self.consume_samples(len))
-	}
-
-	/// Flushes remaining buffered samples into an encoded frame, returning the
-	/// number of samples encoded. In streaming mode, incomplete frames will be
-	/// padded with silence, since the length of the frame was not known.
-	pub fn flush(&mut self) -> Result<usize> {
-		self.sink
-			.flush()
-			.map_err(|err| Error::Write(WriteKind::Flush, err))?;
-		Ok(0)
-	}
-
-	/// Flushes then closes the encoder, filling the rest of the expected length
-	/// with silence.
-	pub fn close(&mut self) -> Result {
-		if self.closed { return Ok(()) }
-		self.closed = true;
-
-		if self.samples() > 0 {
-			let mut silence = Vec::with_capacity(self.samples());
-			silence.fill(0);
-
-			while self.samples() > 0 {
-				self.encode(&silence)?;
-			}
-		}
-		self.flush()?;
-		Ok(())
-	}
-}
-
-impl<S: Write> Drop for Encoder<S> {
-	/// Closes the encoder.
-	fn drop(&mut self) { let _ = self.close(); }
-}
+pub struct Decoder { }
 
 // Codec
 
@@ -247,157 +260,6 @@ static DEQUANT_TABLE: [[i32; 8]; 16] = [
 	[1286, -1286, 4288, -4288, 7718, -7718, 12005, -12005],
 	[1536, -1536, 5120, -5120, 9216, -9216, 14336, -14336],
 ];
-
-// Convenience trait for converting big-endian integers of different sizes.
-trait Int: Sized {
-	const SIZE: usize = mem::size_of::<Self>();
-	fn into_bytes(self) -> [u8; Self::SIZE];
-	fn from_bytes(bytes: [u8; Self::SIZE]) -> Self;
-}
-
-impl Int for u64 {
-	fn into_bytes(self) -> [u8; 8] { self.to_be_bytes() }
-	fn from_bytes(bytes: [u8; 8]) -> Self { u64::from_be_bytes(bytes) }
-}
-
-impl Int for u32 {
-	fn into_bytes(self) -> [u8; 4] { self.to_be_bytes() }
-	fn from_bytes(bytes: [u8; 4]) -> Self { u32::from_be_bytes(bytes) }
-}
-
-impl Int for u16 {
-	fn into_bytes(self) -> [u8; 2] { self.to_be_bytes() }
-	fn from_bytes(bytes: [u8; 2]) -> Self { u16::from_be_bytes(bytes) }
-}
-
-trait QoaSink: Write {
-	fn write_int<T: Int>(
-		&mut self,
-		value: T,
-		kind: impl FnOnce() -> WriteKind
-	) -> Result where [u8; T::SIZE]: {
-		self.write_bytes(&value.into_bytes(), kind)
-	}
-
-	fn write_byte(&mut self, value: u8, kind: impl FnOnce() -> WriteKind) -> Result {
-		self.write_bytes(&[value], kind)
-	}
-
-	fn write_bytes(&mut self, value: &[u8], kind: impl FnOnce() -> WriteKind) -> Result {
-		self.write_all(value).map_err(|err| Error::Write(kind(), err))
-	}
-
-	fn enc_file_header(&mut self, sample_count: u32) -> Result {
-		self.write_int(MAGIC,        || WriteKind::FileHeader("magic bytes"))?;
-		self.write_int(sample_count, || WriteKind::FileHeader("sample count"))
-	}
-
-	fn enc_frame_header(&mut self, channel_count: u8, sample_rate: u32, sample_count: u16, slice_count: usize) -> Result {
-		let size = 24 * channel_count as u16 + 8 * slice_count as u16 * channel_count as u16;
-		self.write_byte(channel_count, || WriteKind::FrameHeader("channel count"))?;
-		self.write_bytes(
-			&sample_rate.into_bytes()[1..], // Clip to 24-bits
-			|| WriteKind::FrameHeader("sample rate")
-		)?;
-		self.write_int(sample_count,   || WriteKind::FrameHeader("sample count"))?;
-		self.write_int(size,           || WriteKind::FrameHeader("size"))
-	}
-
-	fn enc_lms_state(&mut self, value: &QoaLmsState) -> Result {
-		let QoaLmsState { history, weights } = value;
-
-		fn pack(acc: u64, cur: &i16) -> u64 {
-			(acc << 16) | (*cur as u16 & 0xFFFF) as u64
-		}
-
-		let history = history.iter().fold(0, pack);
-		let weights = weights.iter().fold(0, pack);
-		self.write_int(history, || WriteKind::LmsState("history"))?;
-		self.write_int(weights, || WriteKind::LmsState("weights"))
-	}
-
-	fn enc_slices(&mut self, samples: &[i16], channel_count: usize, lms: &mut [QoaLmsState]) -> Result {
-		let mut samples = samples;
-		for chn in 0..channel_count {
-			let len = SLICE_LEN.clamp(0, samples.len());
-			let rng = 0..len * channel_count + chn;
-
-			let mut best_error = -1;
-			let mut best_slice = 0;
-			let mut best_lms = QoaLmsState::default();
-
-			for sf in 0..16 {
-				let mut cur_lms = lms[chn];
-				let mut slice = sf as u64;
-				let mut cur_err = 0;
-
-				for si in rng.clone().step_by(channel_count) {
-					let sample = samples[si];
-					let predicted = cur_lms.predict();
-					let residual = sample as i32 - predicted;
-					let scaled = div(residual, sf);
-					let clamped = scaled.clamp(-8, 8);
-					let quantized = QUANT_TABLE[(clamped + 8) as usize];
-					let dequantized = DEQUANT_TABLE[sf][quantized as usize];
-					let reconst = (predicted + dequantized).clamp(i16::MIN as i32, 32767) as i16;
-
-					let error = sample as i64 - reconst as i64;
-					cur_err += error * error;
-
-					if cur_err > best_error {
-						break;
-					}
-
-					cur_lms.update(reconst, dequantized);
-					slice = slice << 3 | quantized as u64;
-				}
-
-				if cur_err < best_error {
-					best_error = cur_err;
-					best_slice = slice;
-					best_lms = cur_lms;
-				}
-			}
-
-			lms[chn] = best_lms;
-			best_slice <<= (SLICE_LEN - len) * 3;
-			self.write_int(best_slice, || WriteKind::SliceData(chn as u8))?;
-
-			samples = &samples[rng.end..]
-		}
-
-		Ok(())
-	}
-
-	fn enc_frame(
-		&mut self,
-		samples: &[i16],
-		channel_count: usize,
-		sample_count: usize,
-		sample_rate: usize,
-		lms: &mut [QoaLmsState],
-	) -> Result<usize> {
-		let sample_count = FRAME_LEN.clamp(0, sample_count);
-		let len = sample_count * channel_count;
-		let slice_count = (len + SLICE_LEN - 1) / SLICE_LEN;
-		self.enc_frame_header(
-			channel_count as u8,
-			sample_rate as u32,
-			sample_count as u16,
-			slice_count
-		)?;
-
-		for lms in lms.iter() { self.enc_lms_state(lms)? }
-
-		for slice in samples.windows(SLICE_LEN) {
-			self.enc_slices(slice, channel_count, lms)?;
-		}
-
-		Ok(len)
-	}
-}
-
-impl<W: Write> QoaSink for W { }
 
 impl QoaLmsState {
 	fn predict(&self) -> i32 {
