@@ -29,6 +29,8 @@ use amplify_derive::Display;
 pub use encoder::*;
 pub use pcm_io::*;
 
+#[cfg(feature = "conv")]
+pub mod conv;
 mod pcm_io;
 mod encoder;
 
