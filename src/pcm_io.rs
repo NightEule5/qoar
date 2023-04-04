@@ -133,7 +133,7 @@ impl<R: Read> Pcm16Source for ReadSource<R> {
 	}
 
 	fn exhausted(&mut self) -> Result<bool, Self::Error> {
-		self.source.has_data_left()
+		Ok(!self.source.has_data_left()?)
 	}
 
 	fn descriptor(&self) -> Result<StreamDescriptor, DescriptorError> { Ok(self.desc) }

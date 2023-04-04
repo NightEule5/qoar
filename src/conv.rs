@@ -47,6 +47,10 @@ impl FormatSource {
 	}
 
 	fn read(&mut self) -> Result<bool, SymError> {
+		if self.buffer.is_some() {
+			return Ok(true)
+		}
+
 		let Self { track, demuxer, decoder, buffer } = self;
 
 		while let Some(packet) = {
@@ -125,7 +129,7 @@ impl Pcm16Source for FormatSource {
 	}
 
 	fn exhausted(&mut self) -> Result<bool, Self::Error> {
-		Ok(self.buffer.is_some() || self.read()?)
+		Ok(self.buffer.is_none() && !self.read()?)
 	}
 
 	fn descriptor(&self) -> Result<StreamDescriptor, DescriptorError> {
@@ -167,7 +171,7 @@ impl TryFrom<&CodecParameters> for StreamDescriptor {
 			samples.map(|s| s as u32),
 			sample_rate,
 			channels.map(|c| c as u8),
-			false,
+			true,
 		)
 	}
 }
@@ -192,7 +196,7 @@ impl TryFrom<&AudioBuffer<i16>> for StreamDescriptor {
 			Some(samples as u32),
 			Some(rate),
 			Some(channels as u8),
-			false,
+			true,
 		)
 	}
 }

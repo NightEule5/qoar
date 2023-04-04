@@ -92,7 +92,7 @@ pub enum DescriptorError {
 
 impl error::Error for DescriptorError { }
 
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone)]
 pub struct StreamDescriptor {
 	/// The number of samples per channel.
 	sample_count: Option<u32>,
@@ -211,6 +211,17 @@ impl StreamDescriptor {
 
 		if let Some(_c @ 0) = self.sample_rate {
 			self.channel_count = None;
+		}
+	}
+}
+
+impl Default for StreamDescriptor {
+	fn default() -> Self {
+		Self {
+			sample_count: None,
+			sample_rate: None,
+			channel_count: None,
+			interleaved: true,
 		}
 	}
 }

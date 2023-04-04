@@ -19,8 +19,8 @@ use crate::{DEQUANT_TABLE, div, Error, FRAME_LEN, MAGIC, Pcm16Source, QoaLmsStat
 
 struct Frame {
 	slice_width: usize,
-	slice_count: u8,
-	slice_index: u8,
+	slice_count: u16,
+	slice_index: u16,
 	buffer: Vec<i16>,
 }
 
@@ -36,10 +36,10 @@ impl Frame {
 
 	/// Returns `true` if the frame header has been written.
 	fn start(&mut self, samples: usize, channels: usize) -> bool {
-		if self.slice_count > 0 {
+		if self.complete() {
 			let samples = min(FRAME_LEN, samples);
 			self.slice_width = SLICE_LEN * channels;
-			self.slice_count = ((samples + SLICE_LEN - 1) / SLICE_LEN) as u8;
+			self.slice_count = ((samples + SLICE_LEN - 1) / SLICE_LEN) as u16;
 			self.slice_index = 0;
 			self.buffer.reserve(self.slice_width);
 			true
@@ -72,7 +72,7 @@ impl<S: Write> Encoder<S> {
 				Some(sample_count),
 				Some(sample_rate),
 				Some(channel_count),
-				false
+				true
 			).map_err(Error::InvalidDescriptor)?,
 			sink: Some(sink),
 			has_header: false,
@@ -126,9 +126,10 @@ impl<S: Write> Encoder<S> {
 			lms_states.resize(channels as usize, QoaLmsState::default());
 
 			if interleaved {
-				while let n @ 1.. = sink.enc_frame(&source[..samples * channels as usize], samples, channels, rate, lms_states, frame)? {
-					source.truncate(source.len() - n);
-					samples -= n;
+				while let n @ 1.. = sink.enc_frame(source, samples, channels, rate, lms_states, frame)? {
+					println!("{n} encoded");
+					source.truncate(source.len().saturating_sub(n * channels as usize));
+					samples = samples.saturating_sub(n);
 				}
 			} else {
 				todo!("Non-interleaved samples are not yet supported.")
@@ -182,7 +183,7 @@ impl<S: Write> Encoder<S> {
 							  .map_err(|err| Error::SampleRead(err.into()))?;
 				frame.buffer.truncate(n);
 				let n = sink.enc_frame(&[], samples, channels, rate, lms_states, frame)?;
-				samples -= n;
+				samples = samples.saturating_sub(n);
 
 				if n == 0 {
 					break
@@ -364,25 +365,31 @@ trait QoaSink: Write {
 		lms: &mut [QoaLmsState],
 		frame: &mut Frame,
 	) -> Result<usize> {
+		if sample_buf.is_empty() && frame.buffer.is_empty() {
+			return Ok(0)
+		}
+
 		let mut consumed = 0;
 		let mut off = 0;
-		let len = sample_buf.len();
+		let mut len = sample_buf.len();
 
-		if !frame.start(sample_cnt, channels as usize) {
+		if frame.start(sample_cnt, channels as usize) {
 			self.enc_frame_header(channels, rate, sample_cnt as u16, frame.slice_count as usize)?;
 
 			for lms in lms.iter() { self.enc_lms_state(lms)? }
 		}
 
 		{
-			let Frame { slice_width, slice_index, buffer, .. } = frame;
+			let Frame { slice_width, slice_count, slice_index, buffer, .. } = frame;
 
-			if !buffer.is_empty() || len < *slice_width {
-				off = min(*slice_width - buffer.len(), len);
+			len = min(len, *slice_width * *slice_count as usize);
+
+			if !buffer.is_empty() || len <= *slice_width {
+				off = min((*slice_width).saturating_sub(buffer.len()), len);
 				consumed = SLICE_LEN;
 				buffer.extend_from_slice(&sample_buf[..off]);
 
-				if !buffer.len() == *slice_width {
+				if buffer.len() <= *slice_width {
 					self.enc_slice(&buffer, channels as usize, lms)?;
 					*slice_index += 1;
 					buffer.clear();

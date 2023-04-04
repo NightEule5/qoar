@@ -21,14 +21,14 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::PathBuf;
 use amplify_derive::{Display, Error as AmpError};
-use symphonia::core::codecs::DecoderOptions;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::codecs::{Decoder, DecoderOptions};
+use symphonia::core::formats::{FormatOptions, FormatReader, Track};
 use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::{Hint, ProbeResult};
 use symphonia::default::{get_codecs, get_probe};
 use qoar::conv::FormatSource;
-use qoar::{Encoder, Pcm16Source};
+use qoar::{Encoder, Pcm16Source, StreamDescriptor};
 
 #[derive(Clone, Debug, Display, AmpError)]
 enum Error {
@@ -91,9 +91,10 @@ fn enc(src: PathBuf, dst: PathBuf) -> Result<(), Box<dyn StdError>> {
 	)?;
 	let track = demuxer.default_track().ok_or(Error::NoTracks)?;
 	let decoder = registry.make(&track.codec_params, &DecoderOptions::default())?;
+
+	let desc: StreamDescriptor = (&track.codec_params).try_into()?;
 	let mut source = FormatSource::new(track.clone(), demuxer, decoder);
 
-	let desc = source.descriptor()?;
 	let mut enc = Encoder::new_fixed(
 		desc.samples().unwrap_or_default(),
 		desc.rate().unwrap_or_default(),
