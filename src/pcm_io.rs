@@ -144,13 +144,20 @@ impl<R: Read> Pcm16Source for ReadSource<R> {
 // Sink
 
 pub trait Pcm16Sink {
-	type Error: error::Error;
+	type Error: error::Error + Into<Box<dyn error::Error>>;
 
+	/// Writes samples from `buf` into `chn`.
 	fn write(&mut self, buf: &[i16], chn: u8) -> Result<(), Self::Error>;
 
-	fn set_rate(&mut self, sample_rate: u32) -> Result<(), Self::Error>;
-	fn set_channels(&mut self, channel_count: u8) -> Result<(), Self::Error>;
+	/// Sets the `sample_rate` and `channel_count`.
+	fn set_descriptor(
+		&mut self,
+		sample_rate: u32,
+		channel_count: u8
+	) -> Result<(), Self::Error>;
 
-	fn flush(&mut self) -> Result<(), Self::Error>;
-	fn close(&mut self) -> Result<(), Self::Error>;
+	/// Flushes buffered samples.
+	fn flush(&mut self) -> Result<(), Self::Error> { Ok(()) }
+	/// Closes the sink.
+	fn close(&mut self) -> Result<(), Self::Error> { self.flush() }
 }

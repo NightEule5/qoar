@@ -15,7 +15,7 @@
 use std::error::Error;
 use std::{io, result};
 use std::cmp::min;
-use std::io::{Read, Write};
+use std::io::Read;
 use amplify_derive::Display;
 use crate::{DEQUANT_TABLE, MAGIC, Pcm16Sink, QoaLmsState, QoaSlice, SLICE_LEN};
 
@@ -26,24 +26,22 @@ type Result<T = ()> = result::Result<T, DecodeError>;
 
 #[derive(Debug, Display)]
 pub enum DecodeError {
-	#[display("unknown magic byte sequence {0}")]
+	#[display("unknown magic byte sequence {0:?}")]
 	UnknownMagic([u8; 4]),
 	#[display("end of stream reached prematurely")]
 	Eof,
 	#[display("unknown IO error")]
 	Io(io::Error),
-	#[display("decoder closed")]
-	Closed,
 	#[display("could not {0} sink")]
 	Write(DecodeWriteKind, Box<dyn Error>),
+	#[display("could not close sink")]
+	SinkClose(Box<dyn Error>),
 }
 
 #[derive(Copy, Clone, Debug, Display)]
 pub enum DecodeWriteKind {
-	#[display("set channel count in")]
-	SetChannels,
-	#[display("set sample rate in")]
-	SetSampleRate,
+	#[display("set sample rate and channel count in")]
+	SetDescriptor,
 	#[display("write sample to")]
 	Sample,
 }
@@ -51,8 +49,9 @@ pub enum DecodeWriteKind {
 impl Error for DecodeError {
 	fn source(&self) -> Option<&(dyn Error + 'static)> {
 		match self {
-			Self::Io(ref inner) => Some(inner),
-			Self::Write(_, inner) => Some(inner.as_ref()),
+			Io(ref inner)    => Some(inner),
+			Write(_, inner) |
+			SinkClose(inner) => Some(inner.as_ref()),
 			_ => None
 		}
 	}
@@ -68,16 +67,57 @@ impl From<io::Error> for DecodeError {
 	}
 }
 
-/// Decodes all samples from a QOA `source` into a raw PCM16-LE `sink`.
-pub fn decode<S: Read>(source: &mut S, sink: &mut impl Pcm16Sink) -> Result {
-	let mut samples = source.dec_file_header()?;
-	let streaming_mode = samples == 0;
+pub struct Decoder<S: Pcm16Sink> {
+	samples: Option<u32>,
+	sink: S,
+	header: bool,
+	lms: Vec<QoaLmsState>,
+	slice: QoaSlice,
+	slice_buf: [i16; SLICE_LEN],
+}
 
-	let mut lms = Vec::new();
-	let mut slice = QoaSlice::default();
-	let mut slice_buf = [0; SLICE_LEN];
+impl<Sn: Pcm16Sink> Decoder<Sn> {
+	pub fn new(sink: Sn) -> Self {
+		Self {
+			samples: None,
+			sink,
+			header: true,
+			lms: Vec::new(),
+			slice: QoaSlice::default(),
+			slice_buf: [0; SLICE_LEN],
+		}
+	}
+	
+	/// Decodes all samples from a QOA `source`, returning the underlying sink.
+	pub fn decode<S: Read>(mut self, source: &mut S) -> Result<Sn> {
+		while self.decode_frame(source)? { }
+		self.close()
+	}
 
-	while samples > 0 || streaming_mode {
+	/// Decodes a QOA frame from `source`, returning `true` if a frame was decoded.
+	pub fn decode_frame<S: Read>(&mut self, source: &mut S) -> Result<bool> {
+		let Self { samples, sink, header, lms, slice, slice_buf } = self;
+		let streaming_mode;
+		let samples = {
+			if *header {
+				let header_samples = source.dec_file_header()?;
+				streaming_mode = header_samples == 0;
+
+				if !streaming_mode {
+					let _ = samples.insert(header_samples);
+				}
+
+				header_samples
+			} else {
+				streaming_mode = samples.is_none();
+				samples.unwrap_or_default()
+			}
+		};
+
+		if samples == 0 && !streaming_mode {
+			return Ok(false)
+		}
+
 		let (channels, rate, f_samples, _) = {
 			let header = source.dec_frame_header();
 
@@ -86,7 +126,7 @@ pub fn decode<S: Read>(source: &mut S, sink: &mut impl Pcm16Sink) -> Result {
 			// read the number of samples given in the header is an error.
 			if streaming_mode {
 				if let Err(Eof) = header {
-					break
+					return Ok(false)
 				}
 			}
 
@@ -94,24 +134,22 @@ pub fn decode<S: Read>(source: &mut S, sink: &mut impl Pcm16Sink) -> Result {
 		};
 
 		lms.resize_with(channels as usize, Default::default);
-		source.dec_lms(&mut lms)?;
+		source.dec_lms(lms)?;
 
-		sink.set_channels(channels)
-			.map_err(|err| Write(SetChannels, err.into()))?;
-		sink.set_rate(rate)
-			.map_err(|err| Write(SetSampleRate, err.into()))?;
+		sink.set_descriptor(rate, channels)
+			.map_err(|err| Write(SetDescriptor, err.into()))?;
 
 		for sample in (0..f_samples).step_by(SLICE_LEN) {
 			let slice_width = min(SLICE_LEN, (f_samples - sample) as usize);
 			for chn in 0..channels {
-				source.dec_slice(&mut slice)?;
+				source.dec_slice(slice)?;
 
 				let QoaSlice { quant, resid } = slice;
 
 				for si in 0..slice_width {
 					let qr = resid[si];
 					let predicted = lms[chn as usize].predict();
-					let dequantized = DEQUANT_TABLE[quant as usize][qr as usize];
+					let dequantized = DEQUANT_TABLE[*quant as usize][qr as usize];
 					let reconst = (predicted + dequantized).clamp(i16::MIN as i32, 32767) as i16;
 
 					slice_buf[si] = reconst;
@@ -124,10 +162,27 @@ pub fn decode<S: Read>(source: &mut S, sink: &mut impl Pcm16Sink) -> Result {
 			}
 		}
 
-		samples = samples.saturating_sub(f_samples as u32);
+		self.sub_samples(f_samples as u32);
+		Ok(true)
+	}
+	
+	/// Flushes and closes the underlying sink, then returns it.
+	pub fn close(mut self) -> Result<Sn> {
+		self.sink
+			.close()
+			.map_err(|err| SinkClose(err.into()))?;
+		Ok(self.sink)
 	}
 
-	Ok(())
+	fn sub_samples(&mut self, n: u32) {
+		if let Some(ref mut samples) = self.samples {
+			*samples = (*samples).saturating_sub(n);
+		}
+	}
+}
+
+impl<S: Pcm16Sink> From<S> for Decoder<S> {
+	fn from(value: S) -> Self { Self::new(value) }
 }
 
 trait QoaSource: Read {
