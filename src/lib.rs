@@ -21,18 +21,20 @@
 	never_type,
 )]
 
-use std::{error, io};
+use std::{error, io, mem};
 use std::cmp::min;
 use std::fmt::Debug;
 use amplify_derive::Display;
 
 pub use encoder::*;
+pub use decoder::*;
 pub use pcm_io::*;
 
 #[cfg(feature = "conv")]
 pub mod conv;
 mod pcm_io;
 mod encoder;
+mod decoder;
 
 // Error
 
@@ -228,11 +230,15 @@ impl Default for StreamDescriptor {
 
 #[derive(Copy, Clone)]
 struct QoaLmsState {
-	history: [i16; 4],
-	weights: [i16; 4],
+	history: [i32; 4],
+	weights: [i32; 4],
 }
 
-pub struct Decoder { }
+#[derive(Copy, Clone, Default)]
+struct QoaSlice {
+	quant: u8,
+	resid: [u8; 20],
+}
 
 // Codec
 
@@ -288,11 +294,11 @@ impl QoaLmsState {
 		for (history, weight) in self.history
 									 .into_iter()
 									 .zip(self.weights.iter_mut()) {
-			*weight += if history < 0 { -delta } else { delta }
+			*weight += if history < 0 { -delta } else { delta } as i32;
 		}
 
 		self.history.rotate_left(1);
-		self.history[3] = sample;
+		self.history[3] = sample as i32;
 	}
 }
 

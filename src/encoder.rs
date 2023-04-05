@@ -15,7 +15,7 @@
 use std::cmp::min;
 use std::io::Write;
 use std::mem;
-use crate::{DEQUANT_TABLE, div, Error, FRAME_LEN, MAGIC, Pcm16Source, QoaLmsState, QUANT_TABLE, Result, SLICE_LEN, StreamDescriptor, WriteKind};
+use crate::{DEQUANT_TABLE, div, Error, FRAME_LEN, Int, MAGIC, Pcm16Source, QoaLmsState, QUANT_TABLE, Result, SLICE_LEN, StreamDescriptor, WriteKind};
 
 struct Frame {
 	slice_width: usize,
@@ -127,7 +127,6 @@ impl<S: Write> Encoder<S> {
 
 			if interleaved {
 				while let n @ 1.. = sink.enc_frame(source, samples, channels, rate, lms_states, frame)? {
-					println!("{n} encoded");
 					source.truncate(source.len().saturating_sub(n * channels as usize));
 					samples = samples.saturating_sub(n);
 				}
@@ -226,18 +225,6 @@ impl<S: Write> Drop for Encoder<S> {
 	fn drop(&mut self) { let _ = self.close(); }
 }
 
-trait OptionalSub<T> {
-	fn sub(&mut self, value: T);
-}
-
-impl OptionalSub<u32> for Option<u32> {
-	fn sub(&mut self, value: u32) {
-		if let Some(cur) = self {
-			*cur -= value;
-		}
-	}
-}
-
 // Convenience trait for converting big-endian integers of different sizes.
 trait Int: Sized {
 	const SIZE: usize = mem::size_of::<Self>();
@@ -296,7 +283,7 @@ trait QoaSink: Write {
 	fn enc_lms_state(&mut self, value: &QoaLmsState) -> Result {
 		let QoaLmsState { history, weights } = value;
 
-		fn pack(acc: u64, cur: &i16) -> u64 {
+		fn pack(acc: u64, cur: &i32) -> u64 {
 			(acc << 16) | (*cur as u16 & 0xFFFF) as u64
 		}
 

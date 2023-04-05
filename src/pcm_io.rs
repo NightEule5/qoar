@@ -18,6 +18,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use crate::{DescriptorError, StreamDescriptor};
 
+// Source
+
 /// A raw PCM-S16LE audio source.
 pub trait Pcm16Source {
 	type Error: error::Error + Into<Box<dyn error::Error>>;
@@ -137,4 +139,18 @@ impl<R: Read> Pcm16Source for ReadSource<R> {
 	}
 
 	fn descriptor(&self) -> Result<StreamDescriptor, DescriptorError> { Ok(self.desc) }
+}
+
+// Sink
+
+pub trait Pcm16Sink {
+	type Error: error::Error;
+
+	fn write(&mut self, buf: &[i16], chn: u8) -> Result<(), Self::Error>;
+
+	fn set_rate(&mut self, sample_rate: u32) -> Result<(), Self::Error>;
+	fn set_channels(&mut self, channel_count: u8) -> Result<(), Self::Error>;
+
+	fn flush(&mut self) -> Result<(), Self::Error>;
+	fn close(&mut self) -> Result<(), Self::Error>;
 }
