@@ -16,6 +16,7 @@ use std::{error, io};
 use std::cmp::min;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
+use amplify_derive::{Display, Error};
 use crate::{DescriptorError, StreamDescriptor};
 
 // Source
@@ -144,7 +145,7 @@ impl<R: Read> Pcm16Source for ReadSource<R> {
 // Sink
 
 pub trait Pcm16Sink {
-	type Error: error::Error + Into<Box<dyn error::Error>>;
+	type Error: error::Error + Into<Box<dyn error::Error>> = SinkError;
 
 	/// Writes samples from `buf` into `chn`.
 	fn write(&mut self, buf: &[i16], chn: u8) -> Result<(), Self::Error>;
@@ -160,4 +161,97 @@ pub trait Pcm16Sink {
 	fn flush(&mut self) -> Result<(), Self::Error> { Ok(()) }
 	/// Closes the sink.
 	fn close(&mut self) -> Result<(), Self::Error> { self.flush() }
+}
+
+#[derive(Copy, Clone, Debug, Display, Error)]
+pub enum SinkError {
+	#[display(
+		"cannot set descriptor sample rate from {cur_rate} to {set_rate}, and \
+		channel count from {cur_channels} to {set_channels}; this sink is fixed"
+	)]
+	FixedDescriptorSet {
+		cur_rate: u32,
+		set_rate: u32,
+		cur_channels: u8,
+		set_channels: u8,
+	},
+}
+
+/// A PCM sink which writes samples to a [`Vec`] with a fixed sample rate and
+/// channel count.
+#[derive(Default)]
+pub struct VecSink {
+	sink: Vec<i16>,
+	channel_lengths: Vec<usize>,
+	rate: u32,
+	chan: usize,
+}
+
+impl VecSink {
+	pub fn new(sink: Vec<i16>, rate: u32, channels: u8) -> Self {
+		Self {
+			sink,
+			channel_lengths: vec![0; channels as usize],
+			rate,
+			chan: channels as usize,
+		}
+	}
+
+	pub fn into_inner(self) -> Vec<i16> { self.sink }
+
+	fn reserve(&mut self, n: usize) {
+		let Self { sink, chan, .. } = self;
+		sink.resize(sink.len() + n * *chan, 0)
+	}
+}
+
+impl Pcm16Sink for VecSink {
+	type Error = SinkError;
+
+	/// Writes samples in `buf` to channel index `chn`, interleaving. If channels
+	/// aren't the same length, i.e. written out of sequence, channels may be out
+	/// of sync with silence at appended at the end.
+	fn write(&mut self, buf: &[i16], chn: u8) -> Result<(), Self::Error> {
+		let chn = chn as usize;
+		if chn >= self.chan { return Ok(()) }
+
+		let samples = buf.len();
+		self.reserve(samples);
+
+		let len = self.channel_lengths[chn];
+		self.channel_lengths[chn] += samples;
+		for (i, sample) in buf.into_iter().enumerate() {
+			// Write interleaved samples, offset by the current channel length and
+			// multiplied by the channel index.
+			self.sink[(len + i) * chn] = *sample;
+		}
+
+		Ok(())
+	}
+
+	fn set_descriptor(
+		&mut self,
+		sample_rate: u32,
+		channel_count: u8
+	) -> Result<(), Self::Error> {
+		if self.rate == 0 {
+			self.rate = sample_rate;
+		}
+
+		if self.chan == 0 {
+			self.chan = channel_count as usize;
+			self.channel_lengths.resize(self.chan, 0);
+		}
+
+		if self.rate == sample_rate && self.chan == channel_count as usize {
+			Ok(())
+		} else {
+			Err(SinkError::FixedDescriptorSet {
+				cur_rate: self.rate,
+				set_rate: sample_rate,
+				cur_channels: self.chan as u8,
+				set_channels: channel_count,
+			})
+		}
+	}
 }

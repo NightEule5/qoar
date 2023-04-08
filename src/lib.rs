@@ -16,6 +16,7 @@
 
 #![allow(incomplete_features)]
 #![feature(
+	associated_type_defaults,
 	buf_read_has_data_left,
 	generic_const_exprs,
 	never_type,
