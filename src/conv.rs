@@ -16,14 +16,14 @@
 //! Symphonia crate.
 
 use std::io;
-use std::cmp::min;
+use std::cmp::{max, min};
 use errors::{Error as SymError, Error::ResetRequired};
 use symphonia::core::audio::{AudioBuffer, AudioBufferRef, Channels, Signal};
-use symphonia::core::codecs::{CodecType, Decoder, decl_codec_type, CodecParameters};
+use symphonia::core::codecs::{CodecType, Decoder as SymDecoder, decl_codec_type};
 use symphonia::core::errors;
 use symphonia::core::formats::{FormatReader, Track};
-use symphonia::core::units::Time;
-use crate::{DescriptorError, Pcm16Source, Result, StreamDescriptor};
+use crate::{PcmSink, PcmSource, PcmStream, Result};
+use crate::pcm_io::Error;
 
 /// Quite OK Audio
 pub const CODEC_TYPE_QOA: CodecType = decl_codec_type(b"qoaf");
@@ -32,26 +32,31 @@ pub const CODEC_TYPE_QOA: CodecType = decl_codec_type(b"qoaf");
 pub struct FormatSource {
 	track: Track,
 	demuxer: Box<dyn FormatReader>,
-	decoder: Box<dyn Decoder>,
+	decoder: Box<dyn SymDecoder>,
 	buffer: Option<AudioBuffer<i16>>,
+	samples: usize,
 }
 
 impl FormatSource {
-	pub fn new(track: Track, demuxer: Box<dyn FormatReader>, decoder: Box<dyn Decoder>) -> Self {
+	pub fn new(track: Track, demuxer: Box<dyn FormatReader>, decoder: Box<dyn SymDecoder>) -> Self {
+		let samples = track.codec_params
+						   .n_frames
+						   .unwrap_or_default() as usize;
 		Self {
 			track,
 			demuxer,
 			decoder,
 			buffer: None,
+			samples,
 		}
 	}
 
-	fn read(&mut self) -> Result<bool, SymError> {
-		if self.buffer.is_some() {
-			return Ok(true)
-		}
+	fn read(&mut self) -> Result<Option<AudioBuffer<i16>>, SymError> {
+		let Self { track, demuxer, decoder, buffer, .. } = self;
 
-		let Self { track, demuxer, decoder, buffer } = self;
+		if let Some(buf) = buffer.take() {
+			return Ok(Some(buf))
+		}
 
 		while let Some(packet) = {
 			match demuxer.next_packet() {
@@ -77,126 +82,69 @@ impl FormatSource {
 					}
 				}
 
-				let _ = buffer.insert(
+				let buf =
 					match decoder.decode(&packet).map(convert_or_deref) {
 						Err(ResetRequired) => {
 							decoder.reset();
 							decoder.decode(&packet).map(convert_or_deref)
 						}
 						result => result
-					}?
-				);
+					}?;
+				self.samples = self.samples.saturating_sub(buf.frames());
 
-				return Ok(true)
+				return Ok(Some(buf))
 			}
 		}
 
-		Ok(false)
+		Ok(None)
 	}
 }
 
-impl Pcm16Source for FormatSource {
-	type Error = SymError;
+impl PcmStream for FormatSource {
+	fn channel_count(&mut self) -> u8 {
+		self.track
+			.codec_params
+			.channels
+			.map(Channels::count)
+			.unwrap_or_default() as u8
+	}
 
-	fn read_interleaved(&mut self, mut buf: &mut [i16]) -> Result<usize, Self::Error> {
+	fn sample_rate(&mut self) -> u32 {
+		self.track
+			.codec_params
+			.sample_rate
+			.unwrap_or_default()
+	}
+}
+
+impl PcmSource for FormatSource {
+	fn read(&mut self, sink: &mut impl PcmSink, mut sample_count: usize) -> Result<usize, Error> {
 		let mut samples = 0;
-		while let Some(mut sample_buf) = self.read()?.then(|| self.buffer.take()).flatten() {
-			let channels = sample_buf.spec().channels.count();
-			let frames = sample_buf.frames();
-			let slices = min(frames, buf.len() / channels);
+		while let Some(mut buf) = self.read().map_err(|err| Error::Read(err.into()))? {
+			if sample_count == 0 { break }
 
-			for chn in 0..channels {
-				let slices = sample_buf.chan(chn)[..slices]
-					.iter()
-					.enumerate();
-				for (i, slice) in slices {
-					buf[i * chn] = *slice;
-				}
+			let channels = buf.spec().channels.count();
+			sink.set_descriptor(buf.spec().rate, channels as u8)?;
+
+			let read = (0..min(channels, 255))
+				.map(|chn| {
+					let data = buf.chan(chn);
+					let len = min(sample_count, data.len());
+					sink.write(&data[..len], chn as u8)
+				})
+				.reduce(|max_read, read| Ok(max(max_read?, read?))) // Ew
+				.unwrap()?;
+			samples      += read;
+			sample_count -= read;
+
+			buf.truncate(buf.frames() - read);
+
+			if buf.frames() > 0 {
+				let _ = self.buffer.insert(buf);
 			}
-
-			buf = &mut buf[slices * channels..];
-			sample_buf.truncate(frames - slices);
-			samples += slices;
-
-			if frames > 0 {
-				let _ = self.buffer.insert(sample_buf);
-			}
-
-			if buf.is_empty() { break }
 		}
-
 		Ok(samples)
 	}
 
-	fn exhausted(&mut self) -> Result<bool, Self::Error> {
-		Ok(self.buffer.is_none() && !self.read()?)
-	}
-
-	fn descriptor(&self) -> Result<StreamDescriptor, DescriptorError> {
-		self.buffer
-			.as_ref()
-			.map_or_else(
-				|| (&self.track.codec_params).try_into(),
-				TryInto::try_into
-			)
-	}
-}
-
-const MAX_SAMPLES: usize = u32::MAX as usize;
-
-impl TryFrom<&CodecParameters> for StreamDescriptor {
-	type Error = DescriptorError;
-
-	fn try_from(value: &CodecParameters) -> Result<Self, Self::Error> {
-		let CodecParameters { sample_rate, channels, n_frames, time_base, .. } = value.clone();
-
-		let channels = channels.map(Channels::count);
-
-		let samples = (|| {
-			let Time { seconds, frac } = time_base?.calc_time(n_frames?);
-			let rate = sample_rate?;
-
-			Some(rate as u64 * seconds + (rate as f64 * frac).ceil() as u64)
-		})();
-
-		if let Some(channels @ 256..) = channels {
-			return Err(DescriptorError::TooManyChannels(channels))
-		}
-
-		if let Some(samples @ MAX_SAMPLES..) = samples.map(|s| s as usize) {
-			return Err(DescriptorError::TooManySamples(samples))
-		}
-
-		Self::new(
-			samples.map(|s| s as u32),
-			sample_rate,
-			channels.map(|c| c as u8),
-			true,
-		)
-	}
-}
-
-impl TryFrom<&AudioBuffer<i16>> for StreamDescriptor {
-	type Error = DescriptorError;
-
-	fn try_from(value: &AudioBuffer<i16>) -> Result<Self, Self::Error> {
-		let samples = value.frames();
-		let channels = value.spec().channels.count();
-		let rate = value.spec().rate;
-
-		if let channels @ 256.. = channels {
-			return Err(DescriptorError::TooManyChannels(channels))
-		}
-
-		if let samples @ MAX_SAMPLES.. = samples {
-			return Err(DescriptorError::TooManySamples(samples))
-		}
-
-		Self::new(
-			Some(samples as u32),
-			Some(rate),
-			Some(channels as u8),
-			true,
-		)
-	}
+	fn sample_count(&mut self, _: u8) -> usize { self.samples }
 }

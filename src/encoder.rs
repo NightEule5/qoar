@@ -15,13 +15,13 @@
 use std::cmp::min;
 use std::io::Write;
 use std::mem;
-use crate::{DEQUANT_TABLE, div, Error, FRAME_LEN, Int, MAGIC, Pcm16Source, QoaLmsState, QUANT_TABLE, Result, SLICE_LEN, StreamDescriptor, WriteKind};
+use crate::{DEQUANT_TABLE, div, Error, FRAME_LEN, MAGIC, PcmBuffer, PcmSink, PcmSource, QoaLmsState, QUANT_TABLE, Result, SLICE_LEN, StreamDescriptor, WriteKind};
 
 struct Frame {
 	slice_width: usize,
 	slice_count: u16,
 	slice_index: u16,
-	buffer: Vec<i16>,
+	buffer: PcmBuffer,
 }
 
 impl Frame {
@@ -30,18 +30,19 @@ impl Frame {
 			slice_width: SLICE_LEN * channel_count as usize,
 			slice_count: 0,
 			slice_index: 0,
-			buffer: Vec::new(),
+			buffer: PcmBuffer::default(),
 		}
 	}
 
 	/// Returns `true` if the frame header has been written.
 	fn start(&mut self, samples: usize, channels: usize) -> bool {
 		if self.complete() {
+			self.buffer.clear();
 			let samples = min(FRAME_LEN, samples);
 			self.slice_width = SLICE_LEN * channels;
 			self.slice_count = ((samples + SLICE_LEN - 1) / SLICE_LEN) as u16;
 			self.slice_index = 0;
-			self.buffer.reserve(self.slice_width);
+			self.buffer.set_descriptor(SLICE_LEN as u32, channels as u8).unwrap();
 			true
 		} else {
 			false
@@ -71,8 +72,7 @@ impl<S: Write> Encoder<S> {
 			desc: StreamDescriptor::new(
 				Some(sample_count),
 				Some(sample_rate),
-				Some(channel_count),
-				true
+				Some(channel_count)
 			).map_err(Error::InvalidDescriptor)?,
 			sink: Some(sink),
 			has_header: false,
@@ -106,7 +106,7 @@ impl<S: Write> Encoder<S> {
 			}
 		}
 
-		let (samples, rate, channels, interleaved) = desc.unwrap_all();
+		let (samples, rate, channels) = desc.unwrap_all();
 
 		if samples == 0 || rate == 0 || channels == 0 {
 			return Ok(())
@@ -125,13 +125,9 @@ impl<S: Write> Encoder<S> {
 
 			lms_states.resize(channels as usize, QoaLmsState::default());
 
-			if interleaved {
-				while let n @ 1.. = sink.enc_frame(source, samples, channels, rate, lms_states, frame)? {
-					source.truncate(source.len().saturating_sub(n * channels as usize));
-					samples = samples.saturating_sub(n);
-				}
-			} else {
-				todo!("Non-interleaved samples are not yet supported.")
+			while let n @ 1.. = sink.enc_frame(source, samples, channels, rate, lms_states, frame)? {
+				source.truncate(source.len().saturating_sub(n * channels as usize));
+				samples = samples.saturating_sub(n);
 			}
 
 			sink.flush().map_err(|err| Error::Write(WriteKind::Flush, err.into()))?
@@ -142,8 +138,8 @@ impl<S: Write> Encoder<S> {
 	}
 
 	/// Encodes samples from a [`Pcm16Source`].
-	pub fn encode(&mut self, source: &mut impl Pcm16Source) -> Result {
-		let mut desc = source.descriptor().map_err(Error::InvalidDescriptor)?;
+	pub fn encode(&mut self, source: &mut impl PcmSource) -> Result {
+		let mut desc = source.descriptor();
 		let Self { desc: this_desc, has_header, lms_states, frame, .. } = self;
 		desc.infer(this_desc);
 
@@ -154,7 +150,7 @@ impl<S: Write> Encoder<S> {
 			}
 		}
 
-		let (samples, rate, channels, _) = desc.unwrap_all();
+		let (samples, rate, channels) = desc.unwrap_all();
 
 		if samples == 0 || rate == 0 || channels == 0 {
 			return Ok(())
@@ -174,13 +170,8 @@ impl<S: Write> Encoder<S> {
 
 			frame.start(samples, channels as usize);
 
-			while !source.exhausted().map_err(|err| Error::SampleRead(err.into()))? {
-				let off = frame.buffer.len();
-				frame.buffer.resize(frame.slice_width, 0);
-				let ref mut buf = frame.buffer[off..frame.slice_width];
-				let n = source.read_interleaved(buf)
-							  .map_err(|err| Error::SampleRead(err.into()))?;
-				frame.buffer.truncate(n);
+			while !source.read(&mut frame.buffer, frame.slice_width)
+				.map_err(|err| Error::SampleRead(err.into()))? > 0 {
 				let n = sink.enc_frame(&[], samples, channels, rate, lms_states, frame)?;
 				samples = samples.saturating_sub(n);
 
@@ -374,10 +365,10 @@ trait QoaSink: Write {
 			if !buffer.is_empty() || len <= *slice_width {
 				off = min((*slice_width).saturating_sub(buffer.len()), len);
 				consumed = SLICE_LEN;
-				buffer.extend_from_slice(&sample_buf[..off]);
+				buffer.write_interleaved(&sample_buf[..off]).unwrap();
 
-				if buffer.len() <= *slice_width {
-					self.enc_slice(&buffer, channels as usize, lms)?;
+				if buffer.len() <= SLICE_LEN {
+					self.enc_slice(buffer, channels as usize, lms)?;
 					*slice_index += 1;
 					buffer.clear();
 				}
@@ -394,7 +385,7 @@ trait QoaSink: Write {
 			consumed += SLICE_LEN;
 		}
 
-		frame.buffer.extend_from_slice(excess);
+		frame.buffer.write_interleaved(excess).unwrap();
 
 		if frame.complete() {
 			frame.reset();

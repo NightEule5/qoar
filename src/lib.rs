@@ -20,9 +20,11 @@
 	buf_read_has_data_left,
 	generic_const_exprs,
 	never_type,
+	seek_stream_len,
+	specialization,
 )]
 
-use std::{error, io, mem};
+use std::{error, io};
 use std::cmp::min;
 use std::fmt::Debug;
 use amplify_derive::Display;
@@ -103,8 +105,6 @@ pub struct StreamDescriptor {
 	sample_rate: Option<u32>,
 	/// The number of channels.
 	channel_count: Option<u8>,
-	/// Whether the sample data is channel-interleaved.
-	interleaved: bool,
 }
 
 impl StreamDescriptor {
@@ -122,7 +122,6 @@ impl StreamDescriptor {
 		sample_count: Option<u32>,
 		sample_rate: Option<u32>,
 		channel_count: Option<u8>,
-		interleaved: bool,
 	) -> Result<Self, DescriptorError> {
 		if let Some(rate) = sample_rate {
 			if !(1..16777216).contains(&rate) {
@@ -142,7 +141,6 @@ impl StreamDescriptor {
 			sample_count,
 			sample_rate,
 			channel_count,
-			interleaved,
 		})
 	}
 
@@ -167,14 +165,13 @@ impl StreamDescriptor {
 		self.sample_count.is_none()
 	}
 
-	fn unwrap_all(self) -> (u32, u32, u8, bool) {
-		let Self { sample_count, sample_rate, channel_count, interleaved } = self;
+	fn unwrap_all(self) -> (u32, u32, u8) {
+		let Self { sample_count, sample_rate, channel_count } = self;
 
 		(
 			sample_count .unwrap_or_default(),
 			sample_rate  .unwrap_or_default(),
 			channel_count.unwrap_or_default(),
-			interleaved
 		)
 	}
 
@@ -224,7 +221,6 @@ impl Default for StreamDescriptor {
 			sample_count: None,
 			sample_rate: None,
 			channel_count: None,
-			interleaved: true,
 		}
 	}
 }

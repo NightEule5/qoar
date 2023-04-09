@@ -17,7 +17,7 @@ use std::{io, result};
 use std::cmp::min;
 use std::io::Read;
 use amplify_derive::Display;
-use crate::{DEQUANT_TABLE, MAGIC, Pcm16Sink, QoaLmsState, QoaSlice, SLICE_LEN};
+use crate::{DEQUANT_TABLE, MAGIC, PcmSink, QoaLmsState, QoaSlice, SLICE_LEN};
 
 use DecodeError::*;
 use DecodeWriteKind::*;
@@ -67,7 +67,7 @@ impl From<io::Error> for DecodeError {
 	}
 }
 
-pub struct Decoder<S: Pcm16Sink> {
+pub struct Decoder<S: PcmSink> {
 	samples: Option<u32>,
 	sink: S,
 	header: bool,
@@ -76,7 +76,7 @@ pub struct Decoder<S: Pcm16Sink> {
 	slice_buf: [i16; SLICE_LEN],
 }
 
-impl<Sn: Pcm16Sink> Decoder<Sn> {
+impl<Sn: PcmSink> Decoder<Sn> {
 	pub fn new(sink: Sn) -> Self {
 		Self {
 			samples: None,
@@ -181,7 +181,7 @@ impl<Sn: Pcm16Sink> Decoder<Sn> {
 	}
 }
 
-impl<S: Pcm16Sink> From<S> for Decoder<S> {
+impl<S: PcmSink> From<S> for Decoder<S> {
 	fn from(value: S) -> Self { Self::new(value) }
 }
 
