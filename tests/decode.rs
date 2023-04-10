@@ -26,7 +26,7 @@ fn decode_oculus_audio_pack() {
 fn decode_sample(group: &str, name: &str) -> Result<(), Box<dyn Error>> {
 	const PREFIX: &str = "run/qoa_test_samples_2023_02_18";
 	let qoa_path: PathBuf = format!("{PREFIX}/{group}/qoa/{name}.qoa").into();
-	let wav_path: PathBuf = format!("{PREFIX}/{group}/{name}.wav").into();
+	let wav_path: PathBuf = format!("{PREFIX}/{group}/qoa_wav/{name}.qoa.wav").into();
 
 	let qoa = Decoder::new(PcmBuffer::default())
 		.decode(&mut File::open(qoa_path)?)?
