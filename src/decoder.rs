@@ -13,14 +13,14 @@
 // limitations under the License.
 
 use std::error::Error;
-use std::{io, result};
+use std::result;
 use std::cmp::min;
-use std::io::Read;
 use amplify_derive::Display;
 use crate::{DEQUANT_TABLE, MAGIC, PcmSink, QoaLmsState, QoaSlice, SLICE_LEN};
 
 use DecodeError::*;
 use DecodeWriteKind::*;
+use crate::io::{ReadError, SourceStream};
 
 type Result<T = ()> = result::Result<T, DecodeError>;
 
@@ -30,8 +30,8 @@ pub enum DecodeError {
 	UnknownMagic([u8; 4]),
 	#[display("end of stream reached prematurely")]
 	Eof,
-	#[display("unknown IO error")]
-	Io(io::Error),
+	#[display("could not read data ({0})")]
+	Read(ReadError),
 	#[display("could not {0} sink")]
 	Write(DecodeWriteKind, Box<dyn Error>),
 	#[display("could not close sink")]
@@ -49,7 +49,7 @@ pub enum DecodeWriteKind {
 impl Error for DecodeError {
 	fn source(&self) -> Option<&(dyn Error + 'static)> {
 		match self {
-			Io(ref inner)    => Some(inner),
+			Read(ref inner) => Some(inner),
 			Write(_, inner) |
 			SinkClose(inner) => Some(inner.as_ref()),
 			_ => None
@@ -57,12 +57,12 @@ impl Error for DecodeError {
 	}
 }
 
-impl From<io::Error> for DecodeError {
-	fn from(value: io::Error) -> Self {
-		if let io::ErrorKind::UnexpectedEof = value.kind() {
+impl From<ReadError> for DecodeError {
+	fn from(value: ReadError) -> Self {
+		if let ReadError::Eof = value {
 			Eof
 		} else {
-			Io(value)
+			Read(value)
 		}
 	}
 }
@@ -89,17 +89,18 @@ impl<Sn: PcmSink> Decoder<Sn> {
 	}
 	
 	/// Decodes all samples from a QOA `source`, returning the underlying sink.
-	pub fn decode<S: Read>(mut self, source: &mut S) -> Result<Sn> {
+	pub fn decode<S: SourceStream>(mut self, source: &mut S) -> Result<Sn> {
 		while self.decode_frame(source)? { }
 		self.close()
 	}
 
 	/// Decodes a QOA frame from `source`, returning `true` if a frame was decoded.
-	pub fn decode_frame<S: Read>(&mut self, source: &mut S) -> Result<bool> {
+	pub fn decode_frame<S: SourceStream>(&mut self, source: &mut S) -> Result<bool> {
 		let Self { samples, sink, header, lms, slice, slice_buf } = self;
 		let streaming_mode;
 		let samples = {
 			if *header {
+				*header = false;
 				let header_samples = source.dec_file_header()?;
 				streaming_mode = header_samples == 0;
 
@@ -150,7 +151,7 @@ impl<Sn: PcmSink> Decoder<Sn> {
 					let qr = resid[si];
 					let predicted = lms[chn as usize].predict();
 					let dequantized = DEQUANT_TABLE[*quant as usize][qr as usize];
-					let reconst = (predicted + dequantized).clamp(i16::MIN as i32, 32767) as i16;
+					let reconst = (predicted + dequantized) as i16;
 
 					slice_buf[si] = reconst;
 
@@ -185,13 +186,7 @@ impl<S: PcmSink> From<S> for Decoder<S> {
 	fn from(value: S) -> Self { Self::new(value) }
 }
 
-trait QoaSource: Read {
-	fn read_long(&mut self) -> Result<u64> {
-		let mut buf = [0; 8];
-		self.read_exact(&mut buf)?;
-		Ok(u64::from_be_bytes(buf))
-	}
-
+pub(crate) trait QoaSource: SourceStream {
 	fn dec_file_header(&mut self) -> Result<u32> {
 		let v = self.read_long()?;
 
@@ -232,14 +227,48 @@ trait QoaSource: Read {
 	}
 }
 
-impl<R: Read> QoaSource for R { }
+impl<S: SourceStream> QoaSource for S { }
 
 impl QoaSlice {
 	fn unpack(&mut self, mut v: u64) {
-		for resid in &mut self.resid {
-			*resid = (v & 0b111) as u8;
+		let ref mut resid = self.resid;
+		for i in (0..20).rev() {
+			resid[i] = (v & 0b111) as u8;
 			v >>= 3;
 		}
 		self.quant = v as u8;
+	}
+}
+
+#[cfg(test)]
+mod test {
+	use crate::QoaSlice;
+
+	#[test]
+	fn unpack_slice() {
+		// q=9, r00=1, r01=2, ..., r19=6
+		const PACKED: u64 = 0b1001_001_010_011_100_101_110_111_001_010_011_100_101_110_111_001_010_011_100_101_110;
+		const UNPACKED: [u8; 20] = {
+			let mut arr = [0; 20];
+			let mut i = 0;
+			let mut v = 1;
+
+			while i < 20 {
+				arr[i] = v;
+
+				i += 1;
+				v += 1;
+				if v == 8 {
+					v = 1;
+				}
+			}
+
+			arr
+		};
+
+		let mut slice = QoaSlice::default();
+		slice.unpack(PACKED);
+
+		assert_eq!(slice, QoaSlice { quant: 9, resid: UNPACKED });
 	}
 }

@@ -22,7 +22,7 @@ use symphonia::core::audio::{AudioBuffer, AudioBufferRef, Channels, Signal};
 use symphonia::core::codecs::{CodecType, Decoder as SymDecoder, decl_codec_type};
 use symphonia::core::errors;
 use symphonia::core::formats::{FormatReader, Track};
-use crate::{PcmSink, PcmSource, PcmStream, Result};
+use crate::{PcmSink, PcmSource, PcmStream};
 use crate::pcm_io::Error;
 
 /// Quite OK Audio

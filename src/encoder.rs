@@ -13,11 +13,55 @@
 // limitations under the License.
 
 use std::cmp::min;
-use std::io::Write;
-use std::mem;
-use crate::{DEQUANT_TABLE, div, Error, FRAME_LEN, MAGIC, PcmBuffer, PcmSink, PcmSource, QoaLmsState, QUANT_TABLE, Result, SLICE_LEN, StreamDescriptor, WriteKind};
+use std::result;
+use std::error::Error;
+use amplify_derive::Display;
+use crate::{DEQUANT_TABLE, DescriptorError, div, FRAME_LEN, MAGIC, PcmBuffer, PcmSink, PcmSource, QoaLmsState, QUANT_TABLE, SLICE_LEN, StreamDescriptor};
+use crate::io::{SinkStream, WriteError};
+use EncodeError::*;
+use WriteKind::*;
 
-struct Frame {
+type Result<T = ()> = result::Result<T, EncodeError>;
+
+#[derive(Debug, Display)]
+pub enum EncodeError {
+	#[display("invalid stream descriptor ({0}); use streaming mode if unknown")]
+	InvalidDescriptor(DescriptorError),
+	#[display("stream descriptor cannot be set in a fixed encoder")]
+	InvalidDescriptorChange,
+	#[display("could not read samples")]
+	SampleRead(Box<dyn Error>),
+	#[display("could not write {0} ({1})")]
+	Write(WriteKind, WriteError),
+	#[display("could not flush the sink ({0})")]
+	Flush(WriteError),
+	#[display("closed")]
+	Closed,
+}
+
+#[derive(Clone, Debug, Display)]
+pub enum WriteKind {
+	#[display("file header")]
+	FileHeader,
+	#[display("frame header")]
+	FrameHeader,
+	#[display("lms {0}")]
+	LmsState(&'static str),
+	#[display("slice data on channel {0}")]
+	SliceData(u8),
+}
+
+impl Error for EncodeError {
+	fn source(&self) -> Option<&(dyn Error + 'static)> {
+		match self {
+			SampleRead(err) => Some(err.as_ref()),
+			Write(_, err) => Some(err),
+			_ => None
+		}
+	}
+}
+
+pub(crate) struct Frame {
 	slice_width: usize,
 	slice_count: u16,
 	slice_index: u16,
@@ -58,7 +102,7 @@ impl Frame {
 	}
 }
 
-pub struct Encoder<S: Write> {
+pub struct Encoder<S: SinkStream> {
 	desc: StreamDescriptor,
 	sink: Option<S>,
 	has_header: bool,
@@ -66,14 +110,14 @@ pub struct Encoder<S: Write> {
 	frame: Frame,
 }
 
-impl<S: Write> Encoder<S> {
+impl<S: SinkStream> Encoder<S> {
 	pub fn new_fixed(sample_count: u32, sample_rate: u32, channel_count: u8, sink: S) -> Result<Self> {
 		Ok(Self {
 			desc: StreamDescriptor::new(
 				Some(sample_count),
 				Some(sample_rate),
 				Some(channel_count)
-			).map_err(Error::InvalidDescriptor)?,
+			).map_err(InvalidDescriptor)?,
 			sink: Some(sink),
 			has_header: false,
 			lms_states: vec![QoaLmsState::default(); channel_count as usize],
@@ -102,7 +146,7 @@ impl<S: Write> Encoder<S> {
 		} else {
 			if desc.sample_rate   != this_desc.sample_rate ||
 			   desc.channel_count != this_desc.channel_count {
-				return Err(Error::InvalidDescriptorChange)
+				return Err(InvalidDescriptorChange)
 			}
 		}
 
@@ -116,7 +160,7 @@ impl<S: Write> Encoder<S> {
 		let mut samples = samples as usize;
 
 		{
-			let sink = self.sink.as_mut().ok_or(Error::Closed)?;
+			let sink = self.sink.as_mut().ok_or(Closed)?;
 
 			if *has_header {
 				sink.enc_file_header(this_desc.sample_count.unwrap_or_default())?;
@@ -130,7 +174,7 @@ impl<S: Write> Encoder<S> {
 				samples = samples.saturating_sub(n);
 			}
 
-			sink.flush().map_err(|err| Error::Write(WriteKind::Flush, err.into()))?
+			sink.flush().map_err(Flush)?
 		}
 
 		self.set_sample_count(samples as u32);
@@ -146,7 +190,7 @@ impl<S: Write> Encoder<S> {
 		if !this_desc.is_streaming() {
 			if desc.sample_rate   != this_desc.sample_rate ||
 			   desc.channel_count != this_desc.channel_count {
-				return Err(Error::InvalidDescriptorChange)
+				return Err(InvalidDescriptorChange)
 			}
 		}
 
@@ -159,7 +203,7 @@ impl<S: Write> Encoder<S> {
 		let mut samples = samples as usize;
 
 		{
-			let sink = self.sink.as_mut().ok_or(Error::Closed)?;
+			let sink = self.sink.as_mut().ok_or(Closed)?;
 
 			if *has_header {
 				sink.enc_file_header(this_desc.sample_count.unwrap_or_default())?;
@@ -171,7 +215,7 @@ impl<S: Write> Encoder<S> {
 			frame.start(samples, channels as usize);
 
 			while !source.read(&mut frame.buffer, frame.slice_width)
-				.map_err(|err| Error::SampleRead(err.into()))? > 0 {
+				.map_err(|err| SampleRead(err.into()))? > 0 {
 				let n = sink.enc_frame(&[], samples, channels, rate, lms_states, frame)?;
 				samples = samples.saturating_sub(n);
 
@@ -180,7 +224,7 @@ impl<S: Write> Encoder<S> {
 				}
 			}
 
-			sink.flush().map_err(|err| Error::Write(WriteKind::Flush, err.into()))?;
+			sink.flush().map_err(Flush)?;
 		}
 
 		self.set_sample_count(samples as u32);
@@ -195,7 +239,7 @@ impl<S: Write> Encoder<S> {
 	/// Closes the encoder, returning the inner sink if not already closed.
 	pub fn close(&mut self) -> Option<Result<S>> {
 		match self.flush() {
-			Err(Error::Closed) => return None,
+			Err(Closed) => return None,
 			Err(err) => return Some(Err(err)),
 			_ => { }
 		}
@@ -211,77 +255,47 @@ impl<S: Write> Encoder<S> {
 	}
 }
 
-impl<S: Write> Drop for Encoder<S> {
+impl<S: SinkStream> Drop for Encoder<S> {
 	/// Closes the encoder.
 	fn drop(&mut self) { let _ = self.close(); }
 }
 
-// Convenience trait for converting big-endian integers of different sizes.
-trait Int: Sized {
-	const SIZE: usize = mem::size_of::<Self>();
-	fn into_bytes(self) -> [u8; Self::SIZE];
-	fn from_bytes(bytes: [u8; Self::SIZE]) -> Self;
-}
-
-impl Int for u64 {
-	fn into_bytes(self) -> [u8; 8] { self.to_be_bytes() }
-	fn from_bytes(bytes: [u8; 8]) -> Self { u64::from_be_bytes(bytes) }
-}
-
-impl Int for u32 {
-	fn into_bytes(self) -> [u8; 4] { self.to_be_bytes() }
-	fn from_bytes(bytes: [u8; 4]) -> Self { u32::from_be_bytes(bytes) }
-}
-
-impl Int for u16 {
-	fn into_bytes(self) -> [u8; 2] { self.to_be_bytes() }
-	fn from_bytes(bytes: [u8; 2]) -> Self { u16::from_be_bytes(bytes) }
-}
-
-trait QoaSink: Write {
-	fn write_int<T: Int>(
-		&mut self,
-		value: T,
-		kind: impl FnOnce() -> WriteKind
-	) -> Result where [u8; T::SIZE]: {
-		self.write_bytes(&value.into_bytes(), kind)
-	}
-
-	fn write_byte(&mut self, value: u8, kind: impl FnOnce() -> WriteKind) -> Result {
-		self.write_bytes(&[value], kind)
-	}
-
-	fn write_bytes(&mut self, value: &[u8], kind: impl FnOnce() -> WriteKind) -> Result {
-		self.write_all(value).map_err(|err| Error::Write(kind(), err))
-	}
-
+pub(crate) trait QoaSink: SinkStream {
 	fn enc_file_header(&mut self, sample_count: u32) -> Result {
-		self.write_int(MAGIC,        || WriteKind::FileHeader("magic bytes"))?;
-		self.write_int(sample_count, || WriteKind::FileHeader("sample count"))
+		self.write_long((MAGIC as u64) << 32 | sample_count as u64)
+			.map_err(|err| Write(FileHeader, err))
 	}
 
-	fn enc_frame_header(&mut self, channel_count: u8, sample_rate: u32, sample_count: u16, slice_count: usize) -> Result {
-		let size = 24 * channel_count as u16 + 8 * slice_count as u16 * channel_count as u16;
-		self.write_byte(channel_count, || WriteKind::FrameHeader("channel count"))?;
-		self.write_bytes(
-			&sample_rate.into_bytes()[1..], // Clip to 24-bits
-			|| WriteKind::FrameHeader("sample rate")
-		)?;
-		self.write_int(sample_count,   || WriteKind::FrameHeader("sample count"))?;
-		self.write_int(size,           || WriteKind::FrameHeader("size"))
+	fn enc_frame_header(
+		&mut self,
+		channel_count: u8,
+		sample_rate: u32,
+		sample_count: u16,
+		size: u16
+	) -> Result {
+		let mut value = channel_count as u64;
+		value <<= 24;
+		value |= sample_rate as u64;
+		value <<= 16;
+		value |= sample_count as u64;
+		value <<= 16;
+		value |= size as u64;
+
+		self.write_long(value)
+			.map_err(|err| Write(FrameHeader, err))
 	}
 
 	fn enc_lms_state(&mut self, value: &QoaLmsState) -> Result {
 		let QoaLmsState { history, weights } = value;
 
 		fn pack(acc: u64, cur: &i32) -> u64 {
-			(acc << 16) | (*cur as u16 & 0xFFFF) as u64
+			(acc << 16) | *cur as i16 as u16 as u64
 		}
 
 		let history = history.iter().fold(0, pack);
 		let weights = weights.iter().fold(0, pack);
-		self.write_int(history, || WriteKind::LmsState("history"))?;
-		self.write_int(weights, || WriteKind::LmsState("weights"))
+		self.write_long(history).map_err(|err| Write(LmsState("history"), err))?;
+		self.write_long(weights).map_err(|err| Write(LmsState("weights"), err))
 	}
 
 	fn enc_slice(&mut self, samples: &[i16], channel_count: usize, lms: &mut [QoaLmsState]) -> Result {
@@ -328,7 +342,7 @@ trait QoaSink: Write {
 
 			lms[chn] = best_lms;
 			best_slice <<= (SLICE_LEN - len) * 3;
-			self.write_int(best_slice, || WriteKind::SliceData(chn as u8))?;
+			self.write_long(best_slice).map_err(|err| Write(SliceData(chn as u8), err))?;
 		}
 
 		Ok(())
@@ -352,7 +366,8 @@ trait QoaSink: Write {
 		let mut len = sample_buf.len();
 
 		if frame.start(sample_cnt, channels as usize) {
-			self.enc_frame_header(channels, rate, sample_cnt as u16, frame.slice_count as usize)?;
+			let size = 24 * channels as u16 + 8 * frame.slice_count as u16 * channels as u16;
+			self.enc_frame_header(channels, rate, sample_cnt as u16, size)?;
 
 			for lms in lms.iter() { self.enc_lms_state(lms)? }
 		}
@@ -395,4 +410,4 @@ trait QoaSink: Write {
 	}
 }
 
-impl<W: Write> QoaSink for W { }
+impl<S: SinkStream> QoaSink for S { }

@@ -14,33 +14,26 @@
 
 include!("common.rs");
 
-use std::fs::read;
-use qoar::{Encoder, PcmSource, PcmStream};
-use qoar::io::Buffer;
+use qoar::{Decoder, PcmBuffer, PcmSource};
 
 #[test]
-fn encode_oculus_audio_pack() {
-	encode_sample("oculus_audio_pack", "action_drop_coin_01")
+fn decode_oculus_audio_pack() {
+	decode_sample("oculus_audio_pack", "action_drop_coin_01")
 		.map_err(DisplayError)
 		.unwrap()
 }
 
-fn encode_sample(group: &str, name: &str) -> Result<(), Box<dyn Error>> {
+fn decode_sample(group: &str, name: &str) -> Result<(), Box<dyn Error>> {
 	const PREFIX: &str = "run/qoa_test_samples_2023_02_18";
 	let qoa_path: PathBuf = format!("{PREFIX}/{group}/qoa/{name}.qoa").into();
 	let wav_path: PathBuf = format!("{PREFIX}/{group}/{name}.wav").into();
 
-	let mut wav = decode_wav(wav_path)?;
-	let samples  = wav.sample_count(0) as u32;
-	let rate     = wav.sample_rate();
-	let channels = wav.channel_count();
+	let qoa = Decoder::new(PcmBuffer::default())
+		.decode(&mut File::open(qoa_path)?)?
+		.unwrap();
+	let wav = decode_wav(wav_path)?.read_all()?;
 
-	let mut enc = Encoder::new_fixed(samples, rate, channels, Buffer::default())?;
-	enc.encode(&mut wav)?;
-	let enc = enc.close().unwrap()?.encode();
-	let qoa = read(qoa_path)?;
-
-	assert_eq!(OpaqueData(enc), OpaqueData(qoa));
+	assert_eq!(OpaqueData(qoa), OpaqueData(wav));
 
 	Ok(())
 }

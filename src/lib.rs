@@ -23,11 +23,10 @@
 	seek_stream_len,
 	specialization,
 )]
+#![feature(iter_array_chunks)]
 
-use std::{error, io};
 use std::cmp::min;
-use std::fmt::Debug;
-use amplify_derive::Display;
+use amplify_derive::{Display, Error};
 
 pub use encoder::*;
 pub use decoder::*;
@@ -38,50 +37,9 @@ pub mod conv;
 mod pcm_io;
 mod encoder;
 mod decoder;
+pub mod io;
 
-// Error
-
-pub(crate) type Result<T = (), E = Error> = std::result::Result<T, E>;
-
-#[derive(Debug, Display)]
-pub enum Error {
-	#[display("invalid stream descriptor ({0}); use streaming mode if unknown")]
-	InvalidDescriptor(DescriptorError),
-	#[display("stream descriptor cannot be set in a fixed encoder")]
-	InvalidDescriptorChange,
-	#[display("could not read samples")]
-	SampleRead(Box<dyn error::Error>),
-	#[display("could not {0}")]
-	Write(WriteKind, io::Error),
-	#[display("closed")]
-	Closed,
-}
-
-#[derive(Clone, Debug, Display)]
-pub enum WriteKind {
-	#[display("write file header ({0})")]
-	FileHeader(&'static str),
-	#[display("write frame header ({0})")]
-	FrameHeader(&'static str),
-	#[display("write lms state ({0})")]
-	LmsState(&'static str),
-	#[display("write slice data on channel {0}")]
-	SliceData(u8),
-	#[display("flush the sink")]
-	Flush,
-}
-
-impl error::Error for Error {
-	fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-		match self {
-			Self::SampleRead(err) => Some(err.as_ref()),
-			Self::Write(_, err) => Some(err),
-			_ => None
-		}
-	}
-}
-
-#[derive(Copy, Clone, Debug, Display)]
+#[derive(Copy, Clone, Debug, Display, Error)]
 pub enum DescriptorError {
 	#[display("sample rate {0} is outside the range the accepted range, [1,2^24)")]
 	UnsupportedRate(u32),
@@ -94,8 +52,6 @@ pub enum DescriptorError {
 	#[display("QOA streams are limited to 2^32-1 samples, but was {0}")]
 	TooManySamples(usize),
 }
-
-impl error::Error for DescriptorError { }
 
 #[derive(Copy, Clone)]
 pub struct StreamDescriptor {
@@ -225,13 +181,13 @@ impl Default for StreamDescriptor {
 	}
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct QoaLmsState {
 	history: [i32; 4],
 	weights: [i32; 4],
 }
 
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 struct QoaSlice {
 	quant: u8,
 	resid: [u8; 20],
@@ -282,16 +238,18 @@ impl QoaLmsState {
 		let weights = self.weights.into_iter();
 		let history = self.history.into_iter();
 		let predict = weights.zip(history)
-							 .fold(0, |p, (w, h)| p + w as i32 * h as i32);
-		predict >> 13
+							 .fold(0, |p, (w, h)|
+								 p + w as i64 * h as i64
+							 );
+		(predict >> 13) as i32
 	}
 
 	fn update(&mut self, sample: i16, residual: i32) {
-		let delta = (residual >> 4) as i16;
+		let delta = residual >> 4;
 		for (history, weight) in self.history
 									 .into_iter()
 									 .zip(self.weights.iter_mut()) {
-			*weight += if history < 0 { -delta } else { delta } as i32;
+			*weight += if history < 0 { -delta } else { delta };
 		}
 
 		self.history.rotate_left(1);
@@ -310,8 +268,119 @@ impl Default for QoaLmsState {
 
 fn div(v: i32, sf: usize) -> i32 {
 	let recip = RECIP_TABLE[sf];
-	let mut n = (v * recip + (1 << 15)) >> 16;
+	let mut n = ((v as i64 * recip as i64 + (1 << 15)) >> 16) as i32;
 	n += ((v > 0) as i32 - (v < 0) as i32) -
 		 ((n > 0) as i32 - (n < 0) as i32);
 	n
+}
+
+#[cfg(test)]
+mod test {
+	use quickcheck_macros::quickcheck;
+	use quickcheck::{Arbitrary, Gen, TestResult};
+	use crate::decoder::QoaSource;
+	use crate::encoder::QoaSink;
+	use crate::io::Buffer;
+	use crate::QoaLmsState;
+
+	macro_rules! qc_assert_eq {
+	    ($l:expr,$r:expr) => {
+			if $l == $r {
+				TestResult::passed()
+			} else {
+				TestResult::error(
+					format!("Assertion failed:\nLeft -> {:?}\nRight -> {:?}\n", $l, $r)
+				)
+			}
+		};
+	}
+
+	impl Arbitrary for QoaLmsState {
+		fn arbitrary(g: &mut Gen) -> Self {
+			let mut history = [0; 4];
+			let mut weights = [0; 4];
+
+			history.fill_with(|| i16::arbitrary(g) as i32);
+			weights.fill_with(|| i16::arbitrary(g) as i32);
+
+			Self { history, weights }
+		}
+	}
+
+	// Is there really any point to this? This code should generate the same LMS,
+	// it's hard to tell whether a pass means both are wrong or right.
+
+	#[quickcheck]
+	fn lms_predict(lms: QoaLmsState) -> TestResult {
+		let mut exp = 0;
+		for i in 0..4 {
+			exp += lms.history[i] as i64 * lms.weights[i] as i64;
+		}
+		exp >>= 13;
+
+		let act = lms.predict();
+		qc_assert_eq!(act, exp as i32)
+	}
+
+	#[quickcheck]
+	fn lms_update(mut lms: QoaLmsState, sample: i16, residual: i32) -> TestResult {
+		let mut other = lms.clone();
+		let delta = residual >> 4;
+		for i in 0..4 {
+			other.weights[i] += if other.history[i] < 0 { -delta } else { delta };
+		}
+
+		for i in 0..3 {
+			other.history[i] = other.history[i + 1];
+		}
+		other.history[3] = sample as i32;
+
+		lms.update(sample, residual);
+		qc_assert_eq!(lms, other)
+	}
+
+	#[quickcheck]
+	fn codec_file_header(sample_count: u32) -> TestResult {
+		let mut buf = Buffer::default();
+		if let Err(error) = buf.enc_file_header(sample_count) {
+			return TestResult::error(format!("{error}"))
+		}
+
+		match buf.dec_file_header() {
+			Ok(samples) => qc_assert_eq!(samples, sample_count),
+			Err(error)  => TestResult::error(format!("{error}"))
+		}
+	}
+
+	#[quickcheck]
+	fn decode_frame_header(channels: u8, rate: u32, samples: u16, size: u16) -> TestResult {
+		if channels == 0 || !(1..16777216).contains(&rate) || samples == 0 || size == 0 {
+			return TestResult::discard()
+		}
+
+		let mut buf = Buffer::default();
+		if let Err(error) = buf.enc_frame_header(channels, rate, samples, size) {
+			return TestResult::error(format!("{error}"))
+		}
+
+		match buf.dec_frame_header() {
+			Ok(header) => qc_assert_eq!(header, (channels, rate, samples, size)),
+			Err(error) => TestResult::error(format!("{error}"))
+		}
+	}
+
+	#[quickcheck]
+	fn codec_lms(lms: QoaLmsState) -> TestResult {
+		let mut buf = Buffer::default();
+		if let Err(error) = buf.enc_lms_state(&lms) {
+			return TestResult::error(format!("{error}"))
+		}
+
+		let mut decoded = [QoaLmsState::default(); 1];
+		if let Err(error) = buf.dec_lms(&mut decoded) {
+			return TestResult::error(format!("{error}"))
+		}
+
+		qc_assert_eq!(lms, decoded[0])
+	}
 }
