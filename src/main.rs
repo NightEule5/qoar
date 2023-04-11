@@ -18,7 +18,7 @@ use std::assert_matches::assert_matches;
 use std::env::args;
 use std::error::Error as StdError;
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use amplify_derive::{Display, Error as AmpError};
 use symphonia::core::audio::Channels;
@@ -29,7 +29,7 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::{Hint, ProbeResult};
 use symphonia::default::{get_codecs, get_probe};
 use qoar::conv::FormatSource;
-use qoar::Encoder;
+use qoar::{Decoder, Encoder, PcmBuffer};
 
 #[derive(Clone, Debug, Display, AmpError)]
 enum Error {
@@ -60,6 +60,8 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn StdError>> 
 
 	if cmd == "encode" {
 		enc(src, dst)
+	} else if cmd == "decode" {
+		dec(src, dst)
 	} else {
 		Err(Error::UnknownCommand(cmd).into())
 	}
@@ -102,5 +104,23 @@ fn enc(src: PathBuf, dst: PathBuf) -> Result<(), Box<dyn StdError>> {
 		BufWriter::new(dst),
 	)?;
 	enc.encode(&mut source)?;
+	Ok(())
+}
+
+fn dec(src: PathBuf, dst: PathBuf) -> Result<(), Box<dyn StdError>> {
+	assert_matches!(
+		src.extension()
+		   .map(|ext| ext.to_string_lossy())
+		   .as_deref(),
+		Some("qoa")
+	);
+
+	let mut src = BufReader::new(File::open(src)?);
+	let mut dst = File::create(dst)?;
+	dst.write_all(
+		&Decoder::new(PcmBuffer::default())
+			.decode(&mut src)?
+			.encode()
+	)?;
 	Ok(())
 }

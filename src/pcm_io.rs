@@ -158,6 +158,17 @@ impl PcmBuffer {
 		self.buf
 	}
 
+	pub fn encode(self) -> Vec<u8> {
+		let samples = self.unwrap();
+		let mut buf = Vec::with_capacity(samples.len() * 2);
+
+		for sample in samples {
+			buf.extend_from_slice(&sample.to_le_bytes());
+		}
+
+		buf
+	}
+
 	fn reserve(&mut self, samples: usize) {
 		self.reserve_exact(samples * self.chan);
 	}

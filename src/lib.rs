@@ -235,13 +235,10 @@ static DEQUANT_TABLE: [[i32; 8]; 16] = [
 
 impl QoaLmsState {
 	fn predict(&self) -> i32 {
-		let weights = self.weights.into_iter();
-		let history = self.history.into_iter();
-		let predict = weights.zip(history)
-							 .fold(0, |p, (w, h)|
-								 p + w as i64 * h as i64
-							 );
-		(predict >> 13) as i32
+		let history = self.history.iter().cloned();
+		let weights = self.weights.iter().cloned();
+		let p: i32 = history.zip(weights).map(|(h, w)| h * w).sum();
+		p >> 13
 	}
 
 	fn update(&mut self, sample: i16, residual: i32) {
@@ -249,10 +246,10 @@ impl QoaLmsState {
 		for (history, weight) in self.history
 									 .into_iter()
 									 .zip(self.weights.iter_mut()) {
-			*weight += if history < 0 { -delta } else { delta };
+			*weight = if history < 0 { -delta } else { delta };
 		}
 
-		self.history.rotate_left(1);
+		self.history.copy_within(1..4, 0);
 		self.history[3] = sample as i32;
 	}
 }
@@ -314,12 +311,12 @@ mod test {
 	fn lms_predict(lms: QoaLmsState) -> TestResult {
 		let mut exp = 0;
 		for i in 0..4 {
-			exp += lms.history[i] as i64 * lms.weights[i] as i64;
+			exp += lms.history[i] * lms.weights[i];
 		}
 		exp >>= 13;
 
 		let act = lms.predict();
-		qc_assert_eq!(act, exp as i32)
+		qc_assert_eq!(act, exp)
 	}
 
 	#[quickcheck]
