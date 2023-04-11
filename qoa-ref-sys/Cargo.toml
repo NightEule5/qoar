@@ -1,0 +1,10 @@
+[package]
+name = "qoa-ref-sys"
+version = "0.1.0"
+edition = "2021"
+description = "A wrapper around the QOA reference codec, for testing"
+links = "qoa"
+
+[build-dependencies]
+bindgen = "0.65.1"
+cc = "1.0.79"
