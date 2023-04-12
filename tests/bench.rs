@@ -13,49 +13,10 @@
 // limitations under the License.
 
 #![feature(test)]
-
 extern crate test;
 
-use std::ptr::slice_from_raw_parts;
+mod common;
+mod reference_codec_bench;
+mod qoar_bench;
 
-include!("common.rs");
-include!("qoa.rs");
-
-fn qoa_enc(source: &[i16], channels: u32, samplerate: u32, samples: u32) -> Result<&[u8], &str> {
-	let ref mut len = 0;
-	let ref mut desc = qoa_desc {
-		channels,
-		samplerate,
-		samples,
-		lms: [qoa_lms_t {
-			history: [0; 4],
-			weights: [0; 4],
-		}; 8],
-	};
-
-	unsafe {
-		slice_from_raw_parts(
-			qoa_encode(source.as_ptr(), desc, len).cast(),
-			*len as usize
-		).as_ref().ok_or("encode error")
-	}
-}
-
-fn qoa_dec(source: &[u8]) -> Result<&[i16], &str> {
-	let ref mut desc = qoa_desc {
-		channels: 0,
-		samplerate: 0,
-		samples: 0,
-		lms: [qoa_lms_t {
-			history: [0; 4],
-			weights: [0; 4],
-		}; 8],
-	};
-
-	unsafe {
-		slice_from_raw_parts(
-			qoa_decode(source.as_ptr(), source.len() as i32, desc).cast(),
-			desc.samples as usize
-		).as_ref().ok_or("encode error")
-	}
-}
+pub use common::*;

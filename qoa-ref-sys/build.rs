@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::env::var;
 use std::error::Error;
 use std::path::Path;
 
@@ -39,6 +40,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 		.compiler("gcc")
 		.file("qoa-ref-codec.c")
 		.flag("-std=gnu99")
+		.flag("-O3")
 		.flag("-lm")
 		.flag("-w")
 		.compile("qoa");

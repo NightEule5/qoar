@@ -33,9 +33,151 @@ use symphonia::default::{get_codecs, get_probe};
 use zip::ZipArchive;
 use qoar::conv::FormatSource;
 
-pub const TEST_SAMPLE_URL: &'static str = "https://qoaformat.org/samples/qoa_test_samples_2023_02_18.zip";
-pub const TEST_SAMPLE_DIR: &'static str = "run/qoa_test_samples_2023_02_18";
-pub const TEST_SAMPLE_ZIP: &'static str = "qoar/qoa_test_samples_2023_02_18.zip";
+pub const TEST_SAMPLE_URL: &str = "https://qoaformat.org/samples/qoa_test_samples_2023_02_18.zip";
+pub const TEST_SAMPLE_DIR: &str = "run/qoa_test_samples_2023_02_18";
+pub const TEST_SAMPLE_ZIP: &str = "qoar/qoa_test_samples_2023_02_18.zip";
+
+fn sample_path(group: &str, base: Option<&str>, sample: &str, ext: &str) -> PathBuf {
+	let mut path: PathBuf = TEST_SAMPLE_DIR.into();
+	path.push(group);
+	path.extend(base);
+	path.push(format!("{sample}.{ext}"));
+	path
+}
+
+macro_rules! samples {
+    ($($enum_name:ident=>$group:literal{$($sample:ident=>$name:literal)+})+) => {
+		$(
+		pub enum $enum_name {
+			$($sample),+
+		}
+
+		impl $enum_name {
+			const SAMPLES: &[Self] = &[ $(Self::$sample),+ ];
+		}
+
+		impl Sample for $enum_name {
+			fn name(&self) -> &str {
+				match self {
+					$(Self::$sample => $name),+
+				}
+			}
+
+			fn group(&self) -> &str { $group }
+		}
+		)+
+	};
+}
+
+samples! {
+	BandcampSample => "bandcamp" {
+		AllegaeonBeastsAndWorms				=> "allegaeon-beasts-and-worms"
+		DarksideNarrowRoad					=> "darkside_narrow_road"
+		ForestSwordsAnnekasBattle			=> "forest_swords_annekas_battle"
+		FourTetBaby							=> "four_tet_baby"
+		InversePhaseAtaribleLie				=> "inverse_phase_atarible_lie"
+		JulienBakerSprainedAnkle			=> "julien_baker_sprained_ankle"
+		LornDrawnOutLikeAnAche				=> "lorn_drawn_out_like_an_ache"
+		NilsFrahmAllMelody					=> "nils_frahm_all_melody"
+		PlanesMistakenForStarsOneFuckedPony	=> "planes_mistaken_for_stars_one_fucked_pony"
+		WhaleriderDevilGotMe				=> "whalerider_devil_got_me"
+	}
+	
+	OculusAudioPack => "oculus_audio_pack" {
+		ActionDropCoin01				=> "action_drop_coin_01"
+		ActionDropPaperBall				=> "action_drop_paper_ball"
+		ActionShellCasingOnGrass01		=> "action_shell_casing_on_grass_01"
+		ActionSwordScrape02				=> "action_sword_scrape_02"
+		ActionTyping					=> "action_typing"
+		AmbienceForestBirds02			=> "ambience_forest_birds_02"
+		AmbienceForestBirds03			=> "ambience_forest_birds_03"
+		AmbientCityRainLp				=> "ambient_city_rain_lp"
+		AmbientFarmGenericLp			=> "ambient_farm_generic_lp"
+		AmbientNightLp					=> "ambient_night_lp"
+		AmbientWaterLakeShore01Lp		=> "ambient_water_lake_shore_01_lp"
+		AmbientWindChimesLp01			=> "ambient_wind_chimes_lp_01"
+		AmbientWoodCutAxe				=> "ambient_wood_cut_axe"
+		BodyMovementClothingGeneric04	=> "body_movement_clothing_generic_04"
+		BodyMovementWithGear03			=> "body_movement_withGear_03"
+		BounceCartoony03				=> "bounce_cartoony_03"
+		CarEngineHighLp					=> "car_engine_high_lp"
+		CarStartRunStop01				=> "car_start_run_stop_01"
+		CarTrunkClose					=> "car_trunk_close"
+		CreepyBloodSquishSlimy03		=> "creepy_blood_squish_slimy_03"
+		CreepyChains02					=> "creepy_chains_02"
+		CreepyCreature03				=> "creepy_creature_03"
+		CreepyDrone02					=> "creepy_drone_02"
+		CreepyImpactsReverb01			=> "creepy_impacts_reverb_01"
+		CreepyScratch02					=> "creepy_scratch_02"
+		CreepySkullCracking02			=> "creepy_skull_cracking_02"
+		CreepyWhispers01				=> "creepy_whispers_01"
+		DoorLockKey03					=> "door_lock_key_03"
+		DoorsFrontdoorOpen01			=> "doors_frontdoor_open_01"
+		DoorsOfficeDoorknob01			=> "doors_office_doorknob_01"
+		DoorsSlidingLock01				=> "doors_sliding_lock_01"
+		FootstepsShoeConcreteRun04		=> "footsteps_shoe_concrete_run_04"
+		FootstepsShoeDirtRun03			=> "footsteps_shoe_dirt_run_03"
+		FootstepsShoeGrassRun02			=> "footsteps_shoe_grass_run_02"
+		FootstepsShoeGrassWalk05		=> "footsteps_shoe_grass_walk_05"
+		FootstepsShoeMetalRun04			=> "footsteps_shoe_metal_run_04"
+		FootstepsShoeSnowWalk03			=> "footsteps_shoe_snow_walk_03"
+		IndoorDrawerClose02				=> "Indoor_drawer_close_02"
+		IndoorFanOff					=> "Indoor_fan_off"
+		IndoorHydraulic01				=> "indoor_hydraulic_01"
+		IndoorLeverPull03				=> "indoor_lever_pull_03"
+		IndoorSwitchSmallOn01			=> "Indoor_switch_small_on_01"
+		InteractionBookPageTurns		=> "interaction_book_page_turns"
+		InteractionFaucetOn				=> "interaction_faucet_on"
+		InteractionKnapsackNylonClose	=> "interaction_knapsack_nylon_close"
+		InteractionMagicSpell01			=> "interaction_magic_spell_01"
+		InteractionValve01Turn			=> "interaction_valve_01_turn"
+		InteractionWhooshMedium02		=> "interaction_whoosh_medium_02"
+		MachinePowerTool04				=> "machine_power_tool_04"
+		StingAcousticGuitPos01			=> "sting_acoustic_guit_pos_01"
+		StingBanjoHumorous02			=> "sting_banjo_humorous_02"
+		StingLossMallet					=> "sting_loss_mallet"
+		StingLossPiano					=> "sting_loss_piano"
+		StingVictoryMallet				=> "sting_victory_mallet"
+		StingVictoryOrch03				=> "sting_victory_orch_03"
+		StingXpLevelUpOrch01			=> "sting_xp_level_up_orch_01"
+		Swoosh03						=> "swoosh_03"
+		UiCasualMusicalOpen				=> "ui_casual_musical_open"
+		UiLaserShoot02					=> "ui_laser_shoot_02"
+		UiMagicalOpen					=> "ui_magical_open"
+		UiMetalOpen						=> "ui_metal_open"
+		UiNotification03				=> "ui_notification_03"
+		UiPowerup01						=> "ui_powerup_01"
+		UiScifiTraditionalConfirm		=> "ui_scifi_traditional_confirm"
+		UiWoodError						=> "ui_wood_error"
+		VoiceAnimalDuck01				=> "voice_animal_duck_01"
+		VoiceAnimalSheep01				=> "voice_animal_sheep_01"
+		VoiceEvilLaugh02				=> "voice_evil_laugh_02"
+		VoiceHorseNeigh01				=> "voice_horse_neigh_01"
+		VoiceMaleBreathing01			=> "voice_male_breathing_01"
+		VoiceMaleScream01				=> "voice_male_scream_01"
+	}
+}
+
+pub trait Sample: Sized {
+	fn name(&self) -> &str;
+	fn group(&self) -> &str;
+
+	fn wav_path(&self) -> PathBuf {
+		sample_path(self.group(), None, self.name(), "wav")
+	}
+
+	fn qoa_path(&self) -> PathBuf {
+		sample_path(self.group(), Some("qoa"), self.name(), "qoa")
+	}
+
+	fn dec_path(&self) -> PathBuf {
+		sample_path(self.group(), Some("qoa_wav"), self.name(), "qoa.wav")
+	}
+
+	fn decode_wav(&self) -> Result<FormatSource, Box<dyn Error>> {
+		decode_wav(self.wav_path())
+	}
+}
 
 // https://gist.github.com/giuliano-oliveira/4d11d6b3bb003dba3a1b53f43d81b30d
 #[ctor]
@@ -122,7 +264,7 @@ fn download_test_samples() {
 /// A workaround for errors using Debug instead of Display.
 #[derive(Display)]
 #[display("{0}")]
-struct DisplayError(Box<dyn Error>);
+pub struct DisplayError(pub Box<dyn Error>);
 
 impl Debug for DisplayError {
 	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -138,7 +280,7 @@ impl Error for DisplayError {
 
 /// A large block of data that can be asserted without overwhelming the output.
 #[derive(Eq, PartialEq)]
-struct OpaqueData<T: Eq + PartialEq>(Vec<T>);
+pub struct OpaqueData<T: Eq + PartialEq>(pub Vec<T>);
 
 impl<T: Eq + PartialEq> Deref for OpaqueData<T> {
 	type Target = Vec<T>;
