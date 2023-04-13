@@ -15,29 +15,26 @@
 mod common;
 
 use std::error::Error;
-use std::fs::File;
-use std::path::PathBuf;
-use qoar::{Decoder, PcmBuffer, PcmSource};
-use crate::common::{decode_wav, DisplayError, OpaqueData};
+use std::fs::read;
+use qoa_ref_sys::{decode, QoaDesc};
+use qoar::{Decoder, PcmBuffer};
+use qoar::io::Buffer;
+use crate::common::{DisplayError, OculusAudioPack, OpaqueData, Sample};
 
 #[test]
-fn decode_oculus_audio_pack() {
-	decode_sample("oculus_audio_pack", "action_drop_coin_01")
+fn decode_oculus_audio_pack() -> Result<(), DisplayError> {
+	decode_sample(OculusAudioPack::ActionDropCoin01)
 		.map_err(DisplayError)
-		.unwrap()
 }
 
-fn decode_sample(group: &str, name: &str) -> Result<(), Box<dyn Error>> {
-	const PREFIX: &str = "run/qoa_test_samples_2023_02_18";
-	let qoa_path: PathBuf = format!("{PREFIX}/{group}/qoa-ref/{name}.qoa-ref").into();
-	let wav_path: PathBuf = format!("{PREFIX}/{group}/qoa_wav/{name}.qoa-ref.wav").into();
-
-	let qoa = Decoder::new(PcmBuffer::default())
-		.decode(&mut File::open(qoa_path)?)?
+fn decode_sample(sample: impl Sample) -> Result<(), Box<dyn Error>> {
+	let data = read(sample.qoa_path())?;
+	let dec = Decoder::new(PcmBuffer::default())
+		.decode(&mut Buffer::decode(&mut data.clone()))?
 		.unwrap();
-	let wav = decode_wav(wav_path)?.read_all()?;
+	let qoa = decode(&*data, &mut QoaDesc::default())?.to_vec();
 
-	assert_eq!(OpaqueData(qoa), OpaqueData(wav));
+	assert_eq!(OpaqueData(dec), OpaqueData(qoa));
 
 	Ok(())
 }

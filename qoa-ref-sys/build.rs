@@ -12,13 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::env::var;
 use std::error::Error;
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn Error>> {
-	println!("cargo:rerun-if-changed=qoa-ref-codec/qoa.h");
-	println!("cargo:rerun-if-changed=qoa-ref-codec.c");
+	println!("cargo:rerun-if-changed=qoa-ref-codec/qoaconv.c");
 	println!("cargo:rerun-if-changed=src/qoa.rs");
 
 	if !Path::new("qoa-ref-codec").exists() {
@@ -29,16 +27,19 @@ fn main() -> Result<(), Box<dyn Error>> {
 	}
 
 	bindgen::Builder::default()
-		.header("qoa-ref-codec/qoa.h")
+		.header("qoa-ref-codec/qoaconv.c")
 		.layout_tests(false)
-		.derive_default(true)
+		.allowlist_type("qoa_(desc|lms_t)")
+		.allowlist_function("(qoa|qoaconv)_(wav_(read|write)|(encode|decode)(_frame|_header)?)")
+		.merge_extern_blocks(true)
+		.raw_line("#![allow(dead_code)]")
 		.generate()?
 		.write_to_file("src/qoa.rs")?;
 
 	cc::Build::default()
 		.no_default_flags(false)
 		.compiler("gcc")
-		.file("qoa-ref-codec.c")
+		.file("qoa-ref-codec/qoaconv.c")
 		.flag("-std=gnu99")
 		.flag("-O3")
 		.flag("-lm")

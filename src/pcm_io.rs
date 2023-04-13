@@ -16,7 +16,7 @@ use std::{error, io, mem};
 use std::cmp::min;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, Write};
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use amplify_derive::Display;
 use crate::{SLICE_LEN, StreamDescriptor};
 
@@ -59,7 +59,7 @@ pub trait PcmSource: PcmStream {
 	/// number of samples read.
 	fn read(&mut self, buf: &mut impl PcmSink, sample_count: usize) -> Result<usize, Error>;
 
-	fn read_all(mut self) -> Result<Vec<i16>, Error> where Self: Sized {
+	fn read_all(mut self) -> Result<PcmBuffer, Error> where Self: Sized {
 		let mut buf = PcmBuffer::default();
 		let rate = self.sample_rate();
 		let chan = self.channel_count();
@@ -71,7 +71,7 @@ pub trait PcmSource: PcmStream {
 			cnt = self.sample_count(chan);
 		}
 
-		Ok(buf.unwrap())
+		Ok(buf)
 	}
 
 	/// Returns the number of samples per channel available, or `0` if not known.
@@ -189,9 +189,15 @@ impl PcmBuffer {
 }
 
 impl Deref for PcmBuffer {
-	type Target = [i16];
+	type Target = Vec<i16>;
 
 	fn deref(&self) -> &Self::Target { &self.buf }
+}
+
+impl DerefMut for PcmBuffer {
+	fn deref_mut(&mut self) -> &mut Self::Target {
+		&mut self.buf
+	}
 }
 
 impl PcmStream for PcmBuffer {

@@ -14,23 +14,19 @@
 
 use std::error::Error;
 use test::Bencher;
-use qoa_ref_sys::encode;
-use qoar::{PcmSource, PcmStream};
+use qoa_ref_sys::{encode, QoaDesc, read_wav};
 use crate::OculusAudioPack::*;
-use crate::common::Sample;
+use crate::common::{Sample, OpaqueData};
 
 macro_rules! gen_encode {
     ($($name:ident($sample:ident))+) => {
 		$(
 		#[bench]
 		fn $name(b: &mut Bencher) -> Result<(), Box<dyn Error>> {
-			let mut data = $sample.decode_wav()?;
-			let samples  = data.sample_count(0) as u32;
-			let channels = data.channel_count() as u32;
-			let rate     = data.sample_rate();
-			let ref data = data.read_all()?;
+			let ref mut descriptor = QoaDesc::default();
+			let data = read_wav($sample.wav_path(), descriptor)?;
 
-			b.iter(|| encode(data, channels, rate, samples));
+			b.iter(|| encode(data, descriptor));
 			Ok(())
 		}
 		)+

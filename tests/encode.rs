@@ -15,17 +15,15 @@
 mod common;
 
 use std::error::Error;
-use std::fs::read;
-use std::path::PathBuf;
-use qoar::{Encoder, PcmSource, PcmStream};
+use qoa_ref_sys::{encode, QoaDesc, read_wav};
+use qoar::{Encoder, PcmSource, PcmStream, StreamDescriptor};
 use qoar::io::Buffer;
 use crate::common::{DisplayError, OculusAudioPack, OpaqueData, Sample};
 
 #[test]
-fn encode_oculus_audio_pack() {
+fn encode_oculus_audio_pack() -> Result<(), DisplayError> {
 	encode_sample(OculusAudioPack::ActionDropCoin01)
 		.map_err(DisplayError)
-		.unwrap()
 }
 
 fn encode_sample(sample: impl Sample) -> Result<(), Box<dyn Error>> {
@@ -33,11 +31,17 @@ fn encode_sample(sample: impl Sample) -> Result<(), Box<dyn Error>> {
 	let samples  = wav.sample_count(0) as u32;
 	let rate     = wav.sample_rate();
 	let channels = wav.channel_count();
+	let mut data = wav.read_all()?;
 
 	let mut enc = Encoder::new_fixed(samples, rate, channels, Buffer::default())?;
-	enc.encode(&mut wav)?;
+	enc.encode_vec(&mut *data, StreamDescriptor::default())?;
 	let enc = enc.close().unwrap()?.encode();
-	let qoa = read(sample.qoa_path())?;
+	let qoa = {
+		let ref mut descriptor = QoaDesc::default();
+		let data = read_wav(sample.wav_path(), descriptor)?;
+
+		encode(data, descriptor)?.into()
+	};
 
 	assert_eq!(OpaqueData(enc), OpaqueData(qoa));
 
