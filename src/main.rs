@@ -17,7 +17,7 @@
 use std::assert_matches::assert_matches;
 use std::env::args;
 use std::error::Error as StdError;
-use std::fs::File;
+use std::fs::{File, read};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use amplify_derive::{Display, Error as AmpError};
@@ -29,7 +29,7 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::{Hint, ProbeResult};
 use symphonia::default::{get_codecs, get_probe};
 use qoar::conv::FormatSource;
-use qoar::{Decoder, Encoder, PcmBuffer};
+use qoar::{byte_decoder::Decoder, Encoder, PcmBuffer};
 
 #[derive(Clone, Debug, Display, AmpError)]
 enum Error {
@@ -98,9 +98,9 @@ fn enc(src: PathBuf, dst: PathBuf) -> Result<(), Box<dyn StdError>> {
 	let mut source = FormatSource::new(track.clone(), demuxer, decoder);
 
 	let mut enc = Encoder::new_fixed(
-		track.codec_params.n_frames.unwrap_or_default() as u32,
+		track.codec_params.n_frames.unwrap_or_default() as usize,
 		track.codec_params.sample_rate.unwrap_or_default(),
-		track.codec_params.channels.map(Channels::count).unwrap_or_default() as u8,
+		track.codec_params.channels.map(Channels::count).unwrap_or_default(),
 		BufWriter::new(dst),
 	)?;
 	enc.encode(&mut source)?;
@@ -115,12 +115,15 @@ fn dec(src: PathBuf, dst: PathBuf) -> Result<(), Box<dyn StdError>> {
 		Some("qoa")
 	);
 
-	let mut src = BufReader::new(File::open(src)?);
+	let mut src = read(src)?;
 	let mut dst = File::create(dst)?;
-	dst.write_all(
-		&Decoder::new(PcmBuffer::default())
-			.decode(&mut src)?
-			.encode()
-	)?;
+	let mut buf = Vec::new();
+	Decoder::default()
+		.decode(&mut src, &mut buf)?;
+	let buf: Vec<_> = buf.into_iter()
+						 .map(i16::to_le_bytes)
+						 .flatten()
+						 .collect();
+	dst.write_all(&buf)?;
 	Ok(())
 }

@@ -22,6 +22,8 @@ use DecodeError::*;
 use DecodeWriteKind::*;
 use crate::io::{ReadError, SourceStream};
 
+pub mod bytes;
+
 type Result<T = ()> = result::Result<T, DecodeError>;
 
 #[derive(Debug, Display)]
@@ -137,7 +139,7 @@ impl<Sn: PcmSink> Decoder<Sn> {
 		lms.resize_with(channels as usize, Default::default);
 		source.dec_lms(lms)?;
 
-		sink.set_descriptor(rate, channels)
+		sink.set_descriptor(rate, channels as usize)
 			.map_err(|err| Write(SetDescriptor, err.into()))?;
 
 		for sample in (0..f_samples).step_by(SLICE_LEN) {
@@ -158,7 +160,7 @@ impl<Sn: PcmSink> Decoder<Sn> {
 					lms[chn as usize].update(reconst, dequantized);
 				}
 
-				sink.write(&slice_buf[..slice_width], chn)
+				sink.write(&slice_buf[..slice_width], chn as usize)
 					.map_err(|err| Write(Sample, err.into()))?;
 			}
 		}

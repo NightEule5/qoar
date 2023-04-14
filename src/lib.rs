@@ -16,10 +16,12 @@
 
 #![allow(incomplete_features)]
 #![feature(
+	assert_matches,
 	associated_type_defaults,
 	buf_read_has_data_left,
 	generic_const_exprs,
 	never_type,
+	return_position_impl_trait_in_trait,
 	seek_stream_len,
 	specialization,
 )]
@@ -29,7 +31,7 @@ use std::cmp::min;
 use amplify_derive::{Display, Error};
 
 pub use encoder::*;
-pub use decoder::*;
+pub use decoder::bytes as byte_decoder;
 pub use pcm_io::*;
 
 #[cfg(feature = "conv")]
@@ -38,6 +40,7 @@ mod pcm_io;
 mod encoder;
 mod decoder;
 pub mod io;
+mod util;
 
 #[derive(Copy, Clone, Debug, Display, Error)]
 pub enum DescriptorError {
@@ -56,11 +59,11 @@ pub enum DescriptorError {
 #[derive(Copy, Clone)]
 pub struct StreamDescriptor {
 	/// The number of samples per channel.
-	sample_count: Option<u32>,
+	sample_count: Option<usize>,
 	/// The sample rate.
 	sample_rate: Option<u32>,
 	/// The number of channels.
-	channel_count: Option<u8>,
+	channel_count: Option<usize>,
 }
 
 impl StreamDescriptor {
@@ -75,9 +78,9 @@ impl StreamDescriptor {
 	///
 	/// [`DescriptorError::NoSamples`]: `sample_count` is `0`.
 	fn new(
-		sample_count: Option<u32>,
+		sample_count: Option<usize>,
 		sample_rate: Option<u32>,
-		channel_count: Option<u8>,
+		channel_count: Option<usize>,
 	) -> Result<Self, DescriptorError> {
 		if let Some(rate) = sample_rate {
 			if !(1..16777216).contains(&rate) {
@@ -100,11 +103,11 @@ impl StreamDescriptor {
 		})
 	}
 
-	pub fn samples(&self) -> Option<u32> { self.sample_count }
+	pub fn samples(&self) -> Option<usize> { self.sample_count }
 	pub fn rate(&self) -> Option<u32> { self.sample_rate }
-	pub fn channels(&self) -> Option<u8> { self.channel_count }
+	pub fn channels(&self) -> Option<usize> { self.channel_count }
 
-	pub fn suggest_sample_count(&mut self, sample_count: u32) {
+	pub fn suggest_sample_count(&mut self, sample_count: usize) {
 		let samples = self.sample_count.get_or_insert(sample_count);
 		*samples = min(*samples, sample_count);
 	}
@@ -113,7 +116,7 @@ impl StreamDescriptor {
 		let _ = self.sample_rate.get_or_insert(sample_rate);
 	}
 
-	pub fn suggest_channel_count(&mut self, channel_count: u8) {
+	pub fn suggest_channel_count(&mut self, channel_count: usize) {
 		let _ = self.channel_count.get_or_insert(channel_count);
 	}
 	
@@ -121,7 +124,7 @@ impl StreamDescriptor {
 		self.sample_count.is_none()
 	}
 
-	fn unwrap_all(self) -> (u32, u32, u8) {
+	fn unwrap_all(self) -> (usize, u32, usize) {
 		let Self { sample_count, sample_rate, channel_count } = self;
 
 		(
@@ -145,14 +148,12 @@ impl StreamDescriptor {
 		if let Some(samples) = self.sample_count.as_mut() {
 			// Infer channel count from sample count.
 			let _ = self.channel_count.get_or_insert_with(|| {
-				*samples = min(*samples, vec.len() as u32);
-				(vec.len() as u32 / *samples) as u8
+				*samples = min(*samples, vec.len());
+				vec.len() / *samples
 			});
 		} else if let Some(chn) = self.channel_count {
 			// Infer sample count from channel count.
-			let _ = self.sample_count.get_or_insert_with(||
-				vec.len() as u32 / chn as u32
-			);
+			let _ = self.sample_count.get_or_insert_with(|| vec.len() / chn);
 		}
 	}
 

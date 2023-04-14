@@ -16,7 +16,7 @@ use std::env::temp_dir;
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
 use std::fs::{create_dir_all, File, remove_dir, remove_file};
-use std::io;
+use std::{fmt, io};
 use std::io::Write;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -267,7 +267,7 @@ fn download_test_samples() {
 pub struct DisplayError(pub Box<dyn Error>);
 
 impl Debug for DisplayError {
-	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
 		Display::fmt(self, f)
 	}
 }
@@ -280,16 +280,16 @@ impl Error for DisplayError {
 
 /// A large block of data that can be asserted without overwhelming the output.
 #[derive(Eq, PartialEq)]
-pub struct OpaqueData<T: Eq + PartialEq>(pub Vec<T>);
+pub struct OpaqueData<'a, T: Eq + PartialEq + 'a>(pub &'a [T]);
 
-impl<T: Eq + PartialEq> Deref for OpaqueData<T> {
-	type Target = Vec<T>;
+impl<T: Eq + PartialEq> Deref for OpaqueData<'_, T> {
+	type Target = [T];
 
-	fn deref(&self) -> &Self::Target { &self.0 }
+	fn deref(&self) -> &Self::Target { self.0 }
 }
 
-impl<T: Debug + Eq + PartialEq> Debug for OpaqueData<T> {
-	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl<T: Debug + Eq + PartialEq> Debug for OpaqueData<'_, T> {
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
 		let len = self.len();
 		if len > 100 {
 			f.debug_list()
@@ -303,8 +303,8 @@ impl<T: Debug + Eq + PartialEq> Debug for OpaqueData<T> {
 	}
 }
 
-impl<T: Eq + PartialEq> From<Vec<T>> for OpaqueData<T> {
-	fn from(value: Vec<T>) -> Self { Self(value) }
+impl<'a, T: Eq + PartialEq + 'a> From<&'a [T]> for OpaqueData<'a, T> {
+	fn from(value: &'a [T]) -> Self { Self(value) }
 }
 
 fn decode_wav(file_name: PathBuf) -> Result<FormatSource, Box<dyn Error>> {

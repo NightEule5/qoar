@@ -101,15 +101,15 @@ impl FormatSource {
 }
 
 impl PcmStream for FormatSource {
-	fn channel_count(&mut self) -> u8 {
+	fn channel_count(&self) -> usize {
 		self.track
 			.codec_params
 			.channels
 			.map(Channels::count)
-			.unwrap_or_default() as u8
+			.unwrap_or_default()
 	}
 
-	fn sample_rate(&mut self) -> u32 {
+	fn sample_rate(&self) -> u32 {
 		self.track
 			.codec_params
 			.sample_rate
@@ -124,13 +124,13 @@ impl PcmSource for FormatSource {
 			if sample_count == 0 { break }
 
 			let channels = buf.spec().channels.count();
-			sink.set_descriptor(buf.spec().rate, channels as u8)?;
+			sink.set_descriptor(buf.spec().rate, channels)?;
 
 			let read = (0..min(channels, 255))
 				.map(|chn| {
 					let data = buf.chan(chn);
 					let len = min(sample_count, data.len());
-					sink.write(&data[..len], chn as u8)
+					sink.write(&data[..len], chn)
 				})
 				.reduce(|max_read, read| Ok(max(max_read?, read?))) // Ew
 				.unwrap()?;
@@ -146,5 +146,5 @@ impl PcmSource for FormatSource {
 		Ok(samples)
 	}
 
-	fn sample_count(&mut self, _: u8) -> usize { self.samples }
+	fn sample_count(&self) -> usize { self.samples }
 }

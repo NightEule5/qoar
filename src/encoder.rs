@@ -15,6 +15,7 @@
 use std::cmp::min;
 use std::result;
 use std::error::Error;
+use std::ops::Deref;
 use amplify_derive::Display;
 use crate::{DEQUANT_TABLE, DescriptorError, div, FRAME_LEN, MAGIC, PcmBuffer, PcmSink, PcmSource, QoaLmsState, QUANT_TABLE, SLICE_LEN, StreamDescriptor};
 use crate::io::{SinkStream, WriteError};
@@ -69,9 +70,9 @@ pub(crate) struct Frame {
 }
 
 impl Frame {
-	fn new(channel_count: u8) -> Self {
+	fn new(channel_count: usize) -> Self {
 		Self {
-			slice_width: SLICE_LEN * channel_count as usize,
+			slice_width: SLICE_LEN * channel_count,
 			slice_count: 0,
 			slice_index: 0,
 			buffer: PcmBuffer::default(),
@@ -86,7 +87,7 @@ impl Frame {
 			self.slice_width = SLICE_LEN * channels;
 			self.slice_count = ((samples + SLICE_LEN - 1) / SLICE_LEN) as u16;
 			self.slice_index = 0;
-			self.buffer.set_descriptor(SLICE_LEN as u32, channels as u8).unwrap();
+			self.buffer.set_descriptor(SLICE_LEN as u32, channels).unwrap();
 			true
 		} else {
 			false
@@ -111,7 +112,7 @@ pub struct Encoder<S: SinkStream> {
 }
 
 impl<S: SinkStream> Encoder<S> {
-	pub fn new_fixed(sample_count: u32, sample_rate: u32, channel_count: u8, sink: S) -> Result<Self> {
+	pub fn new_fixed(sample_count: usize, sample_rate: u32, channel_count: usize, sink: S) -> Result<Self> {
 		Ok(Self {
 			desc: StreamDescriptor::new(
 				Some(sample_count),
@@ -141,7 +142,7 @@ impl<S: SinkStream> Encoder<S> {
 		desc.infer_from_vec(source, this_desc);
 
 		if this_desc.is_streaming() {
-			this_desc.sample_rate   = desc.sample_count;
+			this_desc.sample_rate   = desc.sample_rate;
 			this_desc.channel_count = desc.channel_count;
 		} else {
 			if desc.sample_rate   != this_desc.sample_rate ||
@@ -250,7 +251,7 @@ impl<S: SinkStream> Encoder<S> {
 	/// Sets the sample count after encoding, if in fixed mode.
 	fn set_sample_count(&mut self, n: u32) {
 		if let Some(ref mut samples) = self.desc.sample_count {
-			*samples = n;
+			*samples = n as usize;
 		}
 	}
 }
@@ -261,14 +262,14 @@ impl<S: SinkStream> Drop for Encoder<S> {
 }
 
 pub(crate) trait QoaSink: SinkStream {
-	fn enc_file_header(&mut self, sample_count: u32) -> Result {
+	fn enc_file_header(&mut self, sample_count: usize) -> Result {
 		self.write_long((MAGIC as u64) << 32 | sample_count as u64)
 			.map_err(|err| Write(FileHeader, err))
 	}
 
 	fn enc_frame_header(
 		&mut self,
-		channel_count: u8,
+		channel_count: usize,
 		sample_rate: u32,
 		sample_count: u16,
 		size: u16
@@ -352,7 +353,7 @@ pub(crate) trait QoaSink: SinkStream {
 		&mut self,
 		sample_buf: &[i16],
 		sample_cnt: usize,
-		channels: u8,
+		channels: usize,
 		rate: u32,
 		lms: &mut [QoaLmsState],
 		frame: &mut Frame,
@@ -383,7 +384,7 @@ pub(crate) trait QoaSink: SinkStream {
 				buffer.write_interleaved(&sample_buf[..off]).unwrap();
 
 				if buffer.len() <= SLICE_LEN {
-					self.enc_slice(buffer, channels as usize, lms)?;
+					//self.enc_slice(buffer., channels, lms)?;
 					*slice_index += 1;
 					buffer.clear();
 				}

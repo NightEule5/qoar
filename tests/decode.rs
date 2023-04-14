@@ -15,10 +15,13 @@
 mod common;
 
 use std::error::Error;
+use std::fmt;
+use std::fmt::{Debug, Formatter};
 use std::fs::read;
 use qoa_ref_sys::{decode, QoaDesc};
-use qoar::{Decoder, PcmBuffer};
+use qoar::byte_decoder::Decoder;
 use qoar::io::Buffer;
+use qoar::{PcmBuffer, PcmFrame, PcmSink};
 use crate::common::{DisplayError, OculusAudioPack, OpaqueData, Sample};
 
 #[test]
@@ -29,12 +32,29 @@ fn decode_oculus_audio_pack() -> Result<(), DisplayError> {
 
 fn decode_sample(sample: impl Sample) -> Result<(), Box<dyn Error>> {
 	let data = read(sample.qoa_path())?;
-	let dec = Decoder::new(PcmBuffer::default())
-		.decode(&mut Buffer::decode(&mut data.clone()))?
-		.unwrap();
-	let qoa = decode(&*data, &mut QoaDesc::default())?.to_vec();
+	let dec = {
+		let mut buf = Vec::new();
+		Decoder::default().decode(&*data, &mut buf)?;
+		buf
+	};
+	let qoa = decode(&*data, &mut QoaDesc::default())?;;
 
-	assert_eq!(OpaqueData(dec), OpaqueData(qoa));
+	assert_eq!(OpaqueData(&dec), OpaqueData(qoa));
 
 	Ok(())
+}
+
+#[derive(Eq, PartialEq)]
+struct OpaqueFrame(PcmFrame);
+
+impl Debug for OpaqueFrame {
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		let Self(frame) = self;
+
+		f.debug_struct("Frame")
+			.field("rate", &frame.rate())
+			.field("channels", &frame.channels())
+			.field("data", &OpaqueData(frame.data()))
+			.finish()
+	}
 }

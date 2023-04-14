@@ -12,28 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{error, io, mem};
+use std::{error, mem};
 use std::cmp::min;
-use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Seek, Write};
-use std::ops::{Deref, DerefMut};
 use amplify_derive::Display;
-use crate::{SLICE_LEN, StreamDescriptor};
+use crate::{FRAME_LEN, StreamDescriptor};
+use crate::util::Then;
 
 // Stream traits
 
 /// A stream of PCM samples.
 pub trait PcmStream {
 	/// Returns the current channel count of the stream, or `0` if not known.
-	fn channel_count(&mut self) -> u8;
+	fn channel_count(&self) -> usize;
 	/// Returns the current sample rate of the stream, or `0` if not known.
-	fn sample_rate(&mut self) -> u32;
+	fn sample_rate(&self) -> u32;
 }
 
 #[derive(Debug, Display)]
 pub enum Error {
-	#[display("cannot set descriptor of fixed sink")]
+	#[display("cannot set immutable stream descriptor")]
 	DescriptorSet,
+	#[display("attempted to write without setting descriptor")]
+	UninitializedDescriptor,
 	#[display("cannot read samples")]
 	Read(Box<dyn error::Error>),
 	#[display("cannot write samples")]
@@ -66,22 +66,20 @@ pub trait PcmSource: PcmStream {
 
 		buf.set_descriptor(rate, chan)?;
 
-		let mut cnt = self.sample_count(chan);
+		let mut cnt = self.sample_count();
 		while self.read(&mut buf, cnt)? > 0 {
-			cnt = self.sample_count(chan);
+			cnt = self.sample_count();
 		}
 
 		Ok(buf)
 	}
 
 	/// Returns the number of samples per channel available, or `0` if not known.
-	/// A `channel_count` is suggested, but not necessarily used, to calculate the
-	/// count. If the channel count is not known and the suggested count is `0`,
-	/// the returned sample count will be the total count.
-	fn sample_count(&mut self, channel_count: u8) -> usize;
+	fn sample_count(&self) -> usize;
 
-	fn descriptor(&mut self) -> StreamDescriptor {
-		let samples  = self.sample_count(0) as u32;
+	/// Gets a [`StreamDescriptor`] instance describing the source.
+	fn descriptor(&self) -> StreamDescriptor {
+		let samples  = self.sample_count();
 		let rate     = self.sample_rate().clamp(0, 16777216);
 		let channels = self.channel_count();
 		StreamDescriptor::new(
@@ -97,18 +95,34 @@ pub trait PcmSink: PcmStream {
 	/// Writes samples from `buf` into `chn`, then returns the number of samples
 	/// written. Care should be taken for channels to be written with same-length
 	/// buffers and in sequence; there are no guarantees of behavior if not.
-	fn write(&mut self, buf: &[i16], chn: u8) -> Result<usize, Error>;
+	fn write(&mut self, buf: &[i16], chn: usize) -> Result<usize, Error>;
 
 	/// Writes interleaved samples from `buf`, then returns the number of slices
 	/// written, or the total number of samples written if the channel count isn't
 	/// known.
 	fn write_interleaved(&mut self, buf: &[i16]) -> Result<usize, Error>;
+	
+	/// Writes a frame, returning the partially consumed frame if it could not be
+	/// completely written.
+	fn write_frame(&mut self, frame: PcmFrame) -> Result<Option<PcmFrame>, Error> {
+		self.set_descriptor(frame.rate, frame.chan)?;
+		self.write_interleaved(frame.data())?;
+		Ok(if frame.is_empty() {
+			None
+		} else {
+			Some(frame)
+		})
+	}
+
+	/// Returns maximum number of samples per channel that can be written to this
+	/// sink.
+	fn sample_capacity(&self) -> usize;
 
 	/// Sets the `sample_rate` and `channel_count`.
 	fn set_descriptor(
 		&mut self,
 		sample_rate: u32,
-		channel_count: u8
+		channel_count: usize
 	) -> Result<(), Error>;
 
 	/// Flushes buffered samples.
@@ -119,256 +133,288 @@ pub trait PcmSink: PcmStream {
 
 // Buffer
 
-/// A buffer of interleaved PCM samples.
-#[derive(Clone, Debug, Default)]
-pub struct PcmBuffer {
-	buf: Vec<i16>,
-	len: Vec<usize>,
+#[derive(Clone, Debug, Eq)]
+pub struct PcmFrame {
+	data: Vec<i16>,
+	len : usize,
+	size: usize,
 	rate: u32,
 	chan: usize,
 }
 
-impl PcmBuffer {
-	pub fn new(sample_count: usize, sample_rate: u32, channel_count: u8) -> Self {
-		let chan = channel_count as usize;
+impl PcmFrame {
+	/// Creates a new frame, using `sample_count` and `channel_count` to size it.
+	///
+	/// # Panics
+	///
+	/// Panics if `sample_rate` or `channel_count` are `0`.
+	pub fn new(sample_count: usize, sample_rate: u32, channel_count: usize) -> Self {
+		assert_ne!(sample_rate, 0, "sample rate must be known");
+		assert_ne!(channel_count, 0, "channel count must be known");
+
 		Self {
-			buf: vec![0; sample_count * chan],
-			len: vec![0; chan],
+			data: Vec::with_capacity(sample_count * channel_count),
+			len : 0,
+			size: sample_count,
 			rate: sample_rate,
-			chan,
+			chan: channel_count,
 		}
 	}
 
-	pub fn len(&self) -> usize { self.len.iter().sum() }
+	/// Trims and returns the internal sample buffer.
+	pub fn unwrap(mut self) -> Vec<i16> {
+		self.trim();
+		self.data
+	}
+
+	/// Returns the number of samples per channel currently in the frame.
+	pub fn len(&self) -> usize { self.len }
+
+	pub fn is_empty(&self) -> bool { self.len == 0 }
+
+	pub fn is_full(&self) -> bool { self.len >= self.size }
+
+	/// Returns the sample rate.
+	pub fn rate(&self) -> u32 { self.rate }
+
+	/// Returns the channel count.
+	pub fn channels(&self) -> usize { self.chan }
+
+	/// Returns the current sample data.
+	pub fn data(&self) -> &[i16] { &self.data }
+
+	/// Grows the frame by `sample_count` samples.
+	pub fn grow(&mut self, sample_count: usize) {
+		self.size += sample_count;
+		self.data.reserve(sample_count * self.chan);
+	}
+
+	/// Trims the frame such that its max size equals its length.
+	pub fn trim(&mut self) {
+		self.size = self.len();
+		self.data.truncate(self.size * self.chan);
+	}
+}
+
+impl PartialEq for PcmFrame {
+	fn eq(&self, other: &Self) -> bool {
+		self.data == other.data &&
+		self.rate == other.rate &&
+		self.chan == other.chan
+	}
+}
+
+impl PcmStream for PcmFrame {
+	fn channel_count(&self) -> usize { self.chan }
+
+	fn sample_rate(&self) -> u32 { self.rate }
+}
+
+impl PcmSource for PcmFrame {
+	fn read(&mut self, buf: &mut impl PcmSink, sample_count: usize) -> Result<usize, Error> {
+		let samples = min(sample_count, self.len * self.chan);
+		let read = buf.write_interleaved(&self.data()[..samples])?;
+		self.len = self.len.saturating_sub(read);
+		self.data.truncate(self.len * self.chan);
+		Ok(read)
+	}
+
+	fn sample_count(&self) -> usize { self.len }
+}
+
+impl PcmSink for PcmFrame {
+	fn write(&mut self, data: &[i16], chn: usize) -> Result<usize, Error> {
+		assert!(chn < self.chan, "channel index out of bounds");
+
+		let len = self.len();
+		let samples = min(data.len(), self.size - len);
+
+		if samples == 0 { return Ok(0) }
+
+		if chn == 0 {
+			self.data.resize(len + samples * self.chan, 0);
+		} else if chn == self.chan - 1 {
+			self.len += samples;
+		}
+
+		let off = len * self.chan + chn;
+		for i in 0..samples {
+			self.data[off + i] = data[i]
+		}
+
+		Ok(samples)
+	}
+
+	fn write_interleaved(&mut self, data: &[i16]) -> Result<usize, Error> {
+		self.len = self.data.len();
+		let samples = min(data.len() / self.chan, self.sample_capacity());
+		self.len += samples;
+
+		let total = samples * self.chan;
+		self.data.extend_from_slice(&data[..total]);
+		Ok(total)
+	}
+
+	fn write_frame(&mut self, mut frame: Self) -> Result<Option<Self>, Error> {
+		self.set_descriptor(frame.rate, frame.chan)?;
+		frame.read(self, frame.sample_count())?;
+		Ok(frame.is_empty().then(|| frame))
+	}
+	
+	fn sample_capacity(&self) -> usize { self.size - self.len }
+
+	fn set_descriptor(&mut self, sample_rate: u32, channel_count: usize) -> Result<(), Error> {
+		(sample_rate != self.rate || channel_count != self.chan)
+			.then_err(Error::DescriptorSet)
+	}
+}
+
+/// A buffer of interleaved PCM samples.
+#[derive(Clone, Debug)]
+pub struct PcmBuffer {
+	buf: Vec<PcmFrame>,
+	frame_size: usize,
+}
+
+impl PcmBuffer {
+	pub fn new(frame_size: usize) -> Self {
+		assert!(frame_size > 0, "frame size must be non-zero");
+
+		Self {
+			buf: Vec::default(),
+			frame_size,
+		}
+	}
+
+	pub fn len(&self) -> usize { self.buf.iter().map(PcmFrame::len).sum() }
 
 	pub fn is_empty(&self) -> bool { self.len() == 0 }
 
 	pub fn clear(&mut self) {
 		self.buf.clear();
-
-		for len in self.len.iter_mut() {
-			*len = 0;
-		}
 	}
 
-	pub fn unwrap(mut self) -> Vec<i16> {
+	/// Returns the underlying frame buffer.
+	pub fn unwrap(self) -> Vec<PcmFrame> { self.buf }
+
+	/// Copies sample data into a byte vector. Sample rate and channel information
+	/// is lost.
+	pub fn encode(&self) -> Vec<u8> {
 		let len = self.len();
-		// Pad with silence if the channels aren't the same length.
-		self.buf.resize(len + ((len % self.chan != 0) as usize * self.chan), 0);
-		self.buf
-	}
+		let mut buf = Vec::with_capacity(len * mem::size_of::<i16>());
 
-	pub fn encode(self) -> Vec<u8> {
-		let samples = self.unwrap();
-		let mut buf = Vec::with_capacity(samples.len() * 2);
-
-		for sample in samples {
-			buf.extend_from_slice(&sample.to_le_bytes());
+		for frame in &self.buf {
+			for sample in &frame.data {
+				buf.extend_from_slice(&sample.to_le_bytes());
+			}
 		}
 
 		buf
 	}
 
-	fn reserve(&mut self, samples: usize) {
-		self.reserve_exact(samples * self.chan);
+	fn new_frame(&mut self, rate: u32, channels: usize) {
+		self.buf.push(PcmFrame::new(self.frame_size, rate, channels))
 	}
 
-	fn reserve_exact(&mut self, total_samples: usize) {
-		self.buf.resize(self.buf.len() + total_samples - total_samples % self.chan, 0);
+	fn frame(&self) -> Option<&PcmFrame> { self.buf.last() }
+
+	fn pop_frame(&mut self, rate: u32, channels: usize) -> PcmFrame {
+		self.set_descriptor(rate, channels).unwrap();
+		self.buf.pop().unwrap()
 	}
 
-	fn truncate(&mut self, samples: usize) {
-		let Self { buf, len, chan, .. } = self;
+	fn descriptor(&self) -> Result<(u32, usize), Error> {
+		self.frame()
+			.map(|f| (f.rate, f.chan))
+			.ok_or(Error::UninitializedDescriptor)
+	}
 
-		buf.truncate(buf.len().saturating_sub(samples * *chan));
+	fn write_with<F: Fn(&mut PcmFrame, &[i16]) -> Result<usize, Error>>(
+		&mut self,
+		mut buf: &[i16],
+		write: F
+	) -> Result<usize, Error> {
+		let (rate, chan) = self.descriptor()?;
 
-		for len in len.iter_mut() {
-			*len = len.saturating_sub(samples);
+		let mut count = 0;
+		while !buf.is_empty() {
+			let mut frame = self.pop_frame(rate, chan);
+			let n = write(&mut frame, buf)?;
+			self.buf.push(frame);
+			buf = &buf[n * chan..];
+			count += n;
 		}
+		Ok(count)
 	}
 }
 
-impl Deref for PcmBuffer {
-	type Target = Vec<i16>;
-
-	fn deref(&self) -> &Self::Target { &self.buf }
-}
-
-impl DerefMut for PcmBuffer {
-	fn deref_mut(&mut self) -> &mut Self::Target {
-		&mut self.buf
-	}
+impl Default for PcmBuffer {
+	fn default() -> Self { Self::new(FRAME_LEN) }
 }
 
 impl PcmStream for PcmBuffer {
-	fn channel_count(&mut self) -> u8 { self.chan as u8 }
+	fn channel_count(&self) -> usize {
+		self.descriptor()
+			.map(|(_, c)| c)
+			.unwrap_or_default()
+	}
 
-	fn sample_rate(&mut self) -> u32 { self.rate }
+	fn sample_rate(&self) -> u32 {
+		self.descriptor()
+			.map(|(r, _)| r)
+			.unwrap_or_default()
+	}
 }
 
 impl PcmSource for PcmBuffer {
 	fn read(&mut self, buf: &mut impl PcmSink, sample_count: usize) -> Result<usize, Error> {
-		buf.set_descriptor(self.rate, self.chan as u8)?;
-		let len = min(self.len(), sample_count * self.chan);
-		let read = buf.write_interleaved(&self[..len])?;
-		self.truncate(read);
-		Ok(read)
+		if sample_count == 0 { return Ok(0) }
+
+		let mut count = 0;
+		while let Some(mut frame) = (count < sample_count)
+			.and_then(|| self.buf.pop()) {
+			count += frame.read(buf, count)?;
+
+			if !frame.is_empty() {
+				self.buf.push(frame)
+			}
+		}
+		Ok(count)
 	}
 
-	fn sample_count(&mut self, _: u8) -> usize { self.len() }
+	fn sample_count(&self) -> usize { self.len() }
 }
 
 impl PcmSink for PcmBuffer {
-	fn write(&mut self, buf: &[i16], chn: u8) -> Result<usize, Error> {
-		let chn = chn as usize;
-		if chn >= self.chan { return Ok(0) }
-
-		self.reserve(buf.len());
-
-		let off = self.len[chn] * self.chan + chn;
-		self.len[chn] += buf.len();
-		for i in 0..buf.len() {
-			self.buf[off + i] = buf[i];
-		}
-
-		Ok(buf.len())
+	fn write(&mut self, buf: &[i16], chn: usize) -> Result<usize, Error> {
+		self.write_with(buf, |frame, buf| frame.write(buf, chn))
 	}
 
 	fn write_interleaved(&mut self, buf: &[i16]) -> Result<usize, Error> {
-		self.reserve_exact(buf.len());
-		let ref mut lengths = self.len;
-		for i in (0..buf.len()).step_by(self.chan) {
-			for chn in 0..self.chan {
-				let off = lengths[chn] + chn;
-				self.buf[off + i] = buf[i];
+		self.write_with(buf, PcmFrame::write_interleaved)
+	}
+
+	fn write_frame(&mut self, frame: PcmFrame) -> Result<Option<PcmFrame>, Error> {
+		if let Some(frame) = self.buf.last_mut() {
+			frame.trim();
+		}
+
+		self.buf.push(frame);
+		Ok(None)
+	}
+
+	fn sample_capacity(&self) -> usize { usize::MAX }
+
+	fn set_descriptor(&mut self, sample_rate: u32, channel_count: usize) -> Result<(), Error> {
+		if let Some(frame) = self.buf.last_mut() {
+			if frame.is_full()             ||
+			   sample_rate   != frame.rate ||
+			   channel_count != frame.chan {
+				self.new_frame(sample_rate, channel_count);
 			}
-		}
-		self.buf.extend_from_slice(buf);
-
-		let chn_len = buf.len() / self.chan;
-		for len in self.len.iter_mut() {
-			*len += chn_len;
-		}
-		Ok(chn_len)
-	}
-
-	fn set_descriptor(&mut self, sample_rate: u32, channel_count: u8) -> Result<(), Error> {
-		if sample_rate > 0 && self.rate == 0 && self.is_empty() {
-			self.rate = sample_rate;
-		}
-
-		if channel_count > 0 && self.chan == 0 && self.is_empty() {
-			self.chan = channel_count as usize;
-			self.len.resize(self.chan, 0);
-		}
-
-		if (sample_rate   == 0 || self.rate == sample_rate) &&
-		   (channel_count == 0 || self.chan == channel_count as usize) {
-			Ok(())
 		} else {
-			Err(Error::DescriptorSet)
+			self.new_frame(sample_rate, channel_count);
 		}
-	}
-}
-
-// IO
-
-trait Source: Read {
-	fn read_i16(&mut self) -> io::Result<Option<i16>> {
-		let mut bytes = [0; 2];
-		if self.read(&mut bytes)? == 2 {
-			Ok(Some(i16::from_le_bytes(bytes)))
-		} else {
-			Ok(None)
-		}
-	}
-}
-
-impl<R: Read> Source for R { }
-
-const SAMPLE_LEN: usize = mem::size_of::<i16>();
-
-default impl<R: Read> PcmStream for BufReader<R> {
-	fn channel_count(&mut self) -> u8 { 0 }
-
-	fn sample_rate(&mut self) -> u32 { 0 }
-}
-
-default impl<R: Read + Seek> PcmSource for BufReader<R> {
-	default fn read(
-		&mut self,
-		buf: &mut impl PcmSink,
-		sample_count: usize
-	) -> Result<usize, Error> {
-		impl From<io::Error> for Error {
-			fn from(value: io::Error) -> Self { Self::Read(value.into()) }
-		}
-
-		if sample_count == 0 { return Ok(0) }
-
-		let mut chan = buf.channel_count() as usize;
-		if chan == 0 { chan = 1; }
-		let len = sample_count * chan;
-
-		let mut samples = Vec::with_capacity(len);
-		while let Some(sample) = self.read_i16()? {
-			samples.push(sample);
-
-			if samples.len() >= len {
-				break
-			}
-		}
-		buf.write_interleaved(&samples)
-	}
-
-	default fn sample_count(&mut self, mut channel_count: u8) -> usize {
-		if channel_count < 1 {
-			channel_count = 1;
-		}
-
-		let byte_count = self.stream_len()
-							 .unwrap_or_default() as usize;
-		byte_count / SAMPLE_LEN / channel_count as usize
-	}
-}
-
-impl PcmStream for BufReader<File> { }
-
-impl PcmSource for BufReader<File> {
-	fn sample_count(&mut self, mut channel_count: u8) -> usize {
-		if channel_count < 1 {
-			channel_count = 1;
-		}
-
-		let byte_count = self.get_ref()
-							 .metadata()
-							 .map(|meta| meta.len())
-							 .unwrap_or_default() as usize;
-		byte_count / SAMPLE_LEN / channel_count as usize
-	}
-}
-
-impl<W: Write> PcmStream for BufWriter<W> {
-	fn channel_count(&mut self) -> u8 { 0 }
-
-	fn sample_rate(&mut self) -> u32 { 0 }
-}
-
-impl<W: Write> PcmSink for BufWriter<W> {
-	fn write(&mut self, _buf: &[i16], _chn: u8) -> Result<usize, Error> {
-		todo!("Planar buffered write operation not yet implemented")
-	}
-
-	fn write_interleaved(&mut self, buf: &[i16]) -> Result<usize, Error> {
-		for sample in buf {
-			self.write_all(&sample.to_le_bytes())
-				.map_err(|err| Error::Write(err.into()))?
-		}
-
-		Ok(buf.len())
-	}
-
-	fn set_descriptor(&mut self, _sample_rate: u32, _channel_count: u8) -> Result<(), Error> {
 		Ok(())
 	}
 }
