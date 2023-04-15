@@ -22,7 +22,7 @@ use crate::common::{DisplayError, OculusAudioPack, OpaqueData, Sample};
 
 #[test]
 fn encode_oculus_audio_pack() -> Result<(), DisplayError> {
-	encode_sample(OculusAudioPack::ActionDropCoin01)
+	encode_sample(OculusAudioPack::ActionDropCoin)
 		.map_err(DisplayError)
 }
 

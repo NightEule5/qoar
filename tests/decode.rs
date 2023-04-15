@@ -26,7 +26,7 @@ use crate::common::{DisplayError, OculusAudioPack, OpaqueData, Sample};
 
 #[test]
 fn decode_oculus_audio_pack() -> Result<(), DisplayError> {
-	decode_sample(OculusAudioPack::ActionDropCoin01)
+	decode_sample(OculusAudioPack::ActionDropCoin)
 		.map_err(DisplayError)
 }
 
@@ -37,7 +37,7 @@ fn decode_sample(sample: impl Sample) -> Result<(), Box<dyn Error>> {
 		Decoder::default().decode(&*data, &mut buf)?;
 		buf
 	};
-	let qoa = decode(&*data, &mut QoaDesc::default())?;;
+	let qoa = decode(&*data, &mut QoaDesc::default())?;
 
 	assert_eq!(OpaqueData(&dec), OpaqueData(qoa));
 
