@@ -20,12 +20,13 @@
 	associated_type_defaults,
 	buf_read_has_data_left,
 	generic_const_exprs,
+	iter_array_chunks,
 	never_type,
 	return_position_impl_trait_in_trait,
 	seek_stream_len,
+	slice_flatten,
 	specialization,
 )]
-#![feature(iter_array_chunks)]
 
 use std::cmp::min;
 use amplify_derive::{Display, Error};
@@ -276,10 +277,11 @@ fn div(v: i32, sf: usize) -> i32 {
 mod test {
 	use quickcheck_macros::quickcheck;
 	use quickcheck::{Arbitrary, Gen, TestResult};
+	use qoa_ref_sys::qoa::qoa_lms_t;
 	use crate::decoder::QoaSource;
 	use crate::encoder::QoaSink;
 	use crate::io::Buffer;
-	use crate::QoaLmsState;
+	use crate::{DEQUANT_TABLE, QoaLmsState};
 
 	macro_rules! qc_assert_eq {
 	    ($l:expr,$r:expr) => {
@@ -305,16 +307,25 @@ mod test {
 		}
 	}
 
-	// Is there really any point to this? This code should generate the same LMS,
-	// it's hard to tell whether a pass means both are wrong or right.
+	impl From<qoa_lms_t> for QoaLmsState {
+		fn from(qoa_lms_t { history, weights }: qoa_lms_t) -> Self {
+			QoaLmsState { history, weights }
+		}
+	}
+
+	impl Into<qoa_lms_t> for QoaLmsState {
+		fn into(self) -> qoa_lms_t {
+			let Self { history, weights } = self;
+			qoa_lms_t { history, weights }
+		}
+	}
 
 	#[quickcheck]
 	fn lms_predict(lms: QoaLmsState) -> TestResult {
-		let mut exp = 0;
-		for i in 0..4 {
-			exp += lms.history[i] * lms.weights[i];
-		}
-		exp >>= 13;
+		let exp = {
+			let mut lms: qoa_lms_t = lms.into();
+			lms.predict()
+		};
 
 		let act = lms.predict();
 		qc_assert_eq!(act, exp)
@@ -322,17 +333,13 @@ mod test {
 
 	#[quickcheck]
 	fn lms_update(mut lms: QoaLmsState, sample: i16, residual: i32) -> TestResult {
-		let mut other = lms.clone();
-		let delta = residual >> 4;
-		for i in 0..4 {
-			other.weights[i] += if other.history[i] < 0 { -delta } else { delta };
+		if !DEQUANT_TABLE.flatten().contains(&residual) {
+			return TestResult::discard()
 		}
 
-		for i in 0..3 {
-			other.history[i] = other.history[i + 1];
-		}
-		other.history[3] = sample as i32;
-
+		let mut other: qoa_lms_t = lms.into();
+		other.update(sample, residual);
+		let other = lms.into();
 		lms.update(sample, residual);
 		qc_assert_eq!(lms, other)
 	}
@@ -340,7 +347,7 @@ mod test {
 	#[quickcheck]
 	fn codec_file_header(sample_count: u32) -> TestResult {
 		let mut buf = Buffer::default();
-		if let Err(error) = buf.enc_file_header(sample_count) {
+		if let Err(error) = buf.enc_file_header(sample_count as usize) {
 			return TestResult::error(format!("{error}"))
 		}
 
@@ -357,7 +364,7 @@ mod test {
 		}
 
 		let mut buf = Buffer::default();
-		if let Err(error) = buf.enc_frame_header(channels, rate, samples, size) {
+		if let Err(error) = buf.enc_frame_header(channels as usize, rate, samples, size) {
 			return TestResult::error(format!("{error}"))
 		}
 

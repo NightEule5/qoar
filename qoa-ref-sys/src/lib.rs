@@ -75,3 +75,13 @@ pub fn decode(source: &[u8], descriptor: &mut QoaDesc) -> Result<&'static [i16],
 		).as_ref().ok_or("decode error")?
 	})
 }
+
+impl qoa_lms_t {
+	pub fn predict(&mut self) -> i32 {
+		unsafe { qoa_lms_predict(self) }
+	}
+
+	pub fn update(&mut self, sample: i16, residual: i32) {
+		unsafe { qoa_lms_update(self, sample as i32, residual) }
+	}
+}

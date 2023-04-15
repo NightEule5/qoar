@@ -18,6 +18,12 @@ pub struct qoa_desc {
     pub error: f64,
 }
 extern "C" {
+    pub fn qoa_lms_predict(lms: *mut qoa_lms_t) -> ::std::os::raw::c_int;
+    pub fn qoa_lms_update(
+        lms: *mut qoa_lms_t,
+        sample: ::std::os::raw::c_int,
+        residual: ::std::os::raw::c_int,
+    );
     pub fn qoa_encode_header(
         qoa: *mut qoa_desc,
         bytes: *mut ::std::os::raw::c_uchar,
