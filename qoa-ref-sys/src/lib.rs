@@ -19,8 +19,8 @@ pub mod qoa;
 
 use std::error::Error;
 use std::path::PathBuf;
-use std::ptr::slice_from_raw_parts;
-use std::ffi::{CStr, CString};
+use std::ptr::slice_from_raw_parts_mut;
+use std::ffi::CString;
 use qoa::*;
 pub use qoa::qoa_desc as QoaDesc;
 
@@ -45,34 +45,48 @@ impl Default for qoa_lms_t {
 	}
 }
 
-pub fn encode(source: &[i16], descriptor: &mut QoaDesc) -> Result<&'static [u8], Box<dyn Error>> {
+pub fn encode(source: &[i16], descriptor: &mut QoaDesc) -> Result<Box<[u8]>, &'static str> {
 	let ref mut len = 0;
 
 	Ok(unsafe {
-		slice_from_raw_parts(
+		let data = slice_from_raw_parts_mut(
 			qoa_encode(source.as_ptr(), descriptor, len).cast(),
 			*len as usize
-		).as_ref().ok_or("encode error")?
+		);
+
+		if data.is_null() {
+			return Err("encode error")
+		}
+
+		Box::from_raw(data)
 	})
 }
 
-pub fn read_wav(path: PathBuf, descriptor: &mut QoaDesc) -> Result<&'static [i16], Box<dyn Error>> {
+pub fn read_wav(path: PathBuf, descriptor: &mut QoaDesc) -> Result<Box<[i16]>, Box<dyn Error>> {
 	let path = CString::new(path.to_str().ok_or("invalid path")?)?;
 
 	Ok(unsafe {
-		slice_from_raw_parts(
+		let data = slice_from_raw_parts_mut(
 			qoaconv_wav_read(path.as_ptr(), descriptor),
 			descriptor.samples as usize
-		).as_ref().unwrap()
+		);
+
+		Box::from_raw(data)
 	})
 }
 
-pub fn decode(source: &[u8], descriptor: &mut QoaDesc) -> Result<&'static [i16], Box<dyn Error>> {
+pub fn decode(source: &[u8], descriptor: &mut QoaDesc) -> Result<Box<[i16]>, &'static str> {
 	Ok(unsafe {
-		slice_from_raw_parts(
+		let data = slice_from_raw_parts_mut(
 			qoa_decode(source.as_ptr(), source.len() as i32, descriptor).cast(),
 			descriptor.samples as usize
-		).as_ref().ok_or("decode error")?
+		);
+
+		if data.is_null() {
+			return Err("decode error")
+		}
+
+		Box::from_raw(data)
 	})
 }
 

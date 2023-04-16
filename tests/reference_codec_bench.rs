@@ -24,7 +24,7 @@ macro_rules! gen {
 			#[bench]
 			fn $name(b: &mut Bencher) -> Result<(), Box<dyn Error>> {
 				let ref mut descriptor = QoaDesc::default();
-				let data = read_wav($sample.wav_path(), descriptor)?;
+				let ref data = read_wav($sample.wav_path(), descriptor)?;
 
 				b.iter(|| encode(data, descriptor));
 				Ok(())
@@ -44,10 +44,7 @@ macro_rules! gen {
 			fn $name(b: &mut Bencher) -> Result<(), Box<dyn Error>> {
 				let mut desc = QoaDesc::default();
 				let data = read($sample.qoa_path())?;
-				b.iter(|| -> Result<_, Box<dyn Error>> {
-					decode(&data, &mut desc)?;
-					Ok(desc)
-				});
+				b.iter(|| decode(&data, &mut desc));
 				Ok(())
 			}
 			)+
