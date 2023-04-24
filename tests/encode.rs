@@ -27,23 +27,23 @@ fn encode_oculus_audio_pack() -> Result<(), DisplayError> {
 }
 
 fn encode_sample(sample: impl Sample) -> Result<(), Box<dyn Error>> {
-	let mut wav = sample.decode_wav()?;
-	let samples  = wav.sample_count(0) as u32;
+	let wav = sample.decode_wav()?;
+	let samples  = wav.sample_count() as u32;
 	let rate     = wav.sample_rate();
 	let channels = wav.channel_count();
 	let mut data = wav.read_all()?;
 
-	let mut enc = Encoder::new_fixed(samples, rate, channels, Buffer::default())?;
-	enc.encode_vec(&mut *data, StreamDescriptor::default())?;
+	let mut enc = Encoder::new_fixed(samples as usize, rate, channels, Buffer::default())?;
+	enc.encode(&mut data)?;
 	let enc = enc.close().unwrap()?.encode();
 	let qoa = {
 		let ref mut descriptor = QoaDesc::default();
 		let data = read_wav(sample.wav_path(), descriptor)?;
 
-		encode(data, descriptor)?.into()
+		encode(data.as_ref(), descriptor)?
 	};
 
-	assert_eq!(OpaqueData(enc), OpaqueData(qoa));
+	assert_eq!(OpaqueData(&*enc), OpaqueData(&*qoa));
 
 	Ok(())
 }

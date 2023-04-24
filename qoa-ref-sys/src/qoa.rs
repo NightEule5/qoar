@@ -39,6 +39,21 @@ extern "C" {
         qoa: *mut qoa_desc,
         out_len: *mut ::std::os::raw::c_uint,
     ) -> *mut ::std::os::raw::c_void;
+    pub fn qoa_scale_sample(
+        sample: ::std::os::raw::c_int,
+        scalefactor: ::std::os::raw::c_int,
+        lms: *mut qoa_lms_t,
+        quantized: *mut ::std::os::raw::c_int,
+        dequantized: *mut ::std::os::raw::c_int,
+        reconstructed: *mut ::std::os::raw::c_int,
+    );
+    pub fn qoa_scale_slice(
+        sample_data: *const ::std::os::raw::c_short,
+        sample_index: ::std::os::raw::c_int,
+        qoa: *mut qoa_desc,
+        frame_len: ::std::os::raw::c_uint,
+        c: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_ulonglong;
     pub fn qoa_decode_header(
         bytes: *const ::std::os::raw::c_uchar,
         size: ::std::os::raw::c_int,

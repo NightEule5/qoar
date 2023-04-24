@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod slice_scaler;
+use slice_scaler::{LinearScaler, VectorScaler};
+
 use std::cmp::min;
 use std::result;
 use std::error::Error;
-use std::ops::Deref;
 use amplify_derive::Display;
-use crate::{DEQUANT_TABLE, DescriptorError, div, FRAME_LEN, MAGIC, PcmBuffer, PcmSink, PcmSource, QoaLmsState, QUANT_TABLE, SLICE_LEN, StreamDescriptor};
+use crate::{DescriptorError, FRAME_LEN, MAGIC, PcmBuffer, PcmSink, PcmSource, QoaLmsState, SLICE_LEN, StreamDescriptor};
 use crate::io::{SinkStream, WriteError};
 use EncodeError::*;
 use WriteKind::*;
@@ -103,16 +105,51 @@ impl Frame {
 	}
 }
 
-pub struct Encoder<S: SinkStream> {
+pub trait SliceScaler: slice_scaler::SliceScaler { }
+
+impl<S: slice_scaler::SliceScaler> SliceScaler for S { }
+
+#[cfg(feature = "simd")]
+pub type SimdEncoder<S> = Encoder<S, VectorScaler>;
+
+pub struct Encoder<S: SinkStream, Sc: SliceScaler = LinearScaler> {
 	desc: StreamDescriptor,
 	sink: Option<S>,
 	has_header: bool,
 	lms_states: Vec<QoaLmsState>,
 	frame: Frame,
+	_scaler: Sc,
 }
 
 impl<S: SinkStream> Encoder<S> {
 	pub fn new_fixed(sample_count: usize, sample_rate: u32, channel_count: usize, sink: S) -> Result<Self> {
+		Self::_new_fixed(sample_count, sample_rate, channel_count, sink, LinearScaler)
+	}
+
+	pub fn new_streaming(sink: S) -> Self {
+		Self::_new_streaming(sink, LinearScaler)
+	}
+}
+
+#[cfg(feature = "simd")]
+impl<S: SinkStream> SimdEncoder<S> {
+	pub fn new_fixed_simd(sample_count: usize, sample_rate: u32, channel_count: usize, sink: S) -> Result<Self> {
+		Self::_new_fixed(
+			sample_count,
+			sample_rate,
+			channel_count,
+			sink,
+			VectorScaler
+		)
+	}
+
+	pub fn new_streaming_simd(sink: S) -> Self {
+		Self::_new_streaming(sink, VectorScaler)
+	}
+}
+
+impl<S: SinkStream, Sc: SliceScaler> Encoder<S, Sc> {
+	fn _new_fixed(sample_count: usize, sample_rate: u32, channel_count: usize, sink: S, scaler: Sc) -> Result<Self> {
 		Ok(Self {
 			desc: StreamDescriptor::new(
 				Some(sample_count),
@@ -123,16 +160,18 @@ impl<S: SinkStream> Encoder<S> {
 			has_header: false,
 			lms_states: vec![QoaLmsState::default(); channel_count as usize],
 			frame: Frame::new(channel_count),
+			_scaler: scaler,
 		})
 	}
 
-	pub fn new_streaming(sink: S) -> Self {
+	fn _new_streaming(sink: S, scaler: Sc) -> Self {
 		Self {
 			desc: StreamDescriptor::default(),
 			sink: Some(sink),
 			has_header: false,
 			lms_states: Vec::new(),
 			frame: Frame::new(0),
+			_scaler: scaler,
 		}
 	}
 
@@ -146,7 +185,7 @@ impl<S: SinkStream> Encoder<S> {
 			this_desc.channel_count = desc.channel_count;
 		} else {
 			if desc.sample_rate   != this_desc.sample_rate ||
-			   desc.channel_count != this_desc.channel_count {
+				desc.channel_count != this_desc.channel_count {
 				return Err(InvalidDescriptorChange)
 			}
 		}
@@ -170,7 +209,7 @@ impl<S: SinkStream> Encoder<S> {
 
 			lms_states.resize(channels as usize, QoaLmsState::default());
 
-			while let n @ 1.. = sink.enc_frame(source, samples, channels, rate, lms_states, frame)? {
+			while let n @ 1.. = sink.enc_frame::<Sc>(source, samples, channels, rate, lms_states, frame)? {
 				source.truncate(source.len().saturating_sub(n * channels as usize));
 				samples = samples.saturating_sub(n);
 			}
@@ -190,7 +229,7 @@ impl<S: SinkStream> Encoder<S> {
 
 		if !this_desc.is_streaming() {
 			if desc.sample_rate   != this_desc.sample_rate ||
-			   desc.channel_count != this_desc.channel_count {
+				desc.channel_count != this_desc.channel_count {
 				return Err(InvalidDescriptorChange)
 			}
 		}
@@ -216,8 +255,8 @@ impl<S: SinkStream> Encoder<S> {
 			frame.start(samples, channels as usize);
 
 			while !source.read(&mut frame.buffer, frame.slice_width)
-				.map_err(|err| SampleRead(err.into()))? > 0 {
-				let n = sink.enc_frame(&[], samples, channels, rate, lms_states, frame)?;
+						 .map_err(|err| SampleRead(err.into()))? > 0 {
+				let n = sink.enc_frame::<Sc>(&[], samples, channels, rate, lms_states, frame)?;
 				samples = samples.saturating_sub(n);
 
 				if n == 0 {
@@ -256,7 +295,7 @@ impl<S: SinkStream> Encoder<S> {
 	}
 }
 
-impl<S: SinkStream> Drop for Encoder<S> {
+impl<S: SinkStream, Sc: SliceScaler> Drop for Encoder<S, Sc> {
 	/// Closes the encoder.
 	fn drop(&mut self) { let _ = self.close(); }
 }
@@ -299,57 +338,23 @@ pub(crate) trait QoaSink: SinkStream {
 		self.write_long(weights).map_err(|err| Write(LmsState("weights"), err))
 	}
 
-	fn enc_slice(&mut self, samples: &[i16], channel_count: usize, lms: &mut [QoaLmsState]) -> Result {
+	fn enc_slice<Scaler: SliceScaler>(
+		&mut self,
+		samples: &[i16],
+		channel_count: usize,
+		lms: &mut [QoaLmsState]
+	) -> Result {
 		for chn in 0..channel_count {
-			let len = SLICE_LEN.clamp(0, samples.len());
-			let rng = 0..len * channel_count + chn;
-
-			let mut best_error = -1;
-			let mut best_slice = 0;
-			let mut best_lms = QoaLmsState::default();
-
-			for sf in 0..16 {
-				let mut cur_lms = lms[chn];
-				let mut slice = sf as u64;
-				let mut cur_err = 0;
-
-				for si in rng.clone().step_by(channel_count) {
-					let sample = samples[si];
-					let predicted = cur_lms.predict();
-					let residual = sample as i32 - predicted;
-					let scaled = div(residual, sf);
-					let clamped = scaled.clamp(-8, 8);
-					let quantized = QUANT_TABLE[(clamped + 8) as usize];
-					let dequantized = DEQUANT_TABLE[sf][quantized as usize];
-					let reconst = (predicted + dequantized).clamp(i16::MIN as i32, 32767) as i16;
-
-					let error = sample as i64 - reconst as i64;
-					cur_err += error * error;
-
-					if cur_err > best_error {
-						break;
-					}
-
-					cur_lms.update(reconst, dequantized);
-					slice = slice << 3 | quantized as u64;
-				}
-
-				if cur_err < best_error {
-					best_error = cur_err;
-					best_slice = slice;
-					best_lms = cur_lms;
-				}
-			}
-
-			lms[chn] = best_lms;
-			best_slice <<= (SLICE_LEN - len) * 3;
-			self.write_long(best_slice).map_err(|err| Write(SliceData(chn as u8), err))?;
+			self.write_long(Scaler::scale(samples, &mut lms[chn], chn, channel_count))
+				.map_err(|err|
+					Write(SliceData(chn as u8), err)
+				)?;
 		}
 
 		Ok(())
 	}
 
-	fn enc_frame(
+	fn enc_frame<Scaler: SliceScaler>(
 		&mut self,
 		sample_buf: &[i16],
 		sample_cnt: usize,
@@ -396,7 +401,7 @@ pub(crate) trait QoaSink: SinkStream {
 		for slice in slices {
 			if frame.complete() { break }
 
-			self.enc_slice(slice, channels as usize, lms)?;
+			self.enc_slice::<Scaler>(slice, channels as usize, lms)?;
 			frame.slice_index += 1;
 			consumed += SLICE_LEN;
 		}

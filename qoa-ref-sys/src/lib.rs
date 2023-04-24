@@ -45,6 +45,41 @@ impl Default for qoa_lms_t {
 	}
 }
 
+pub fn scale_sample(
+	sample: i32,
+	sf: i32,
+	lms: &mut qoa_lms_t,
+) -> (u8, i32, i16) {
+	let mut quant = 0;
+	let mut dequant = 0;
+	let mut reconst = 0;
+	unsafe {
+		qoa_scale_sample(sample, sf, lms, &mut quant, &mut dequant, &mut reconst);
+	}
+	(quant as u8, dequant, reconst as i16)
+}
+
+pub fn scale_slice(
+	samples: &[i16],
+	channels: usize,
+	lms: &mut [qoa_lms_t; 8],
+	chn: usize,
+) -> u64 {
+	let ref mut qoa = qoa_desc {
+		channels: channels as u32,
+		samplerate: 0,
+		samples: 0,
+		lms: *lms,
+		error: 0.0,
+	};
+
+	let slice = unsafe {
+		qoa_scale_slice(samples.as_ptr(), 0, qoa, (samples.len() / channels) as u32, chn as i32)
+	};
+	*lms = qoa.lms;
+	slice
+}
+
 pub fn encode(source: &[i16], descriptor: &mut QoaDesc) -> Result<Box<[u8]>, &'static str> {
 	let ref mut len = 0;
 

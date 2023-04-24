@@ -39,7 +39,7 @@ fn decode_sample(sample: impl Sample) -> Result<(), Box<dyn Error>> {
 	};
 	let qoa = decode(&*data, &mut QoaDesc::default())?;
 
-	assert_eq!(OpaqueData(&dec), OpaqueData(qoa));
+	assert_eq!(OpaqueData(&dec), OpaqueData(&qoa));
 
 	Ok(())
 }

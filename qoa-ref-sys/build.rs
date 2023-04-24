@@ -30,7 +30,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 		.header("qoa-ref-codec/qoaconv.c")
 		.layout_tests(false)
 		.allowlist_type("qoa_(desc|lms_t)")
-		.allowlist_function("(qoa|qoaconv)_(wav_(read|write)|(encode|decode)(_frame|_header)?|lms_(predict|update))")
+		.allowlist_function(
+			"(qoa|qoaconv)_(\
+			wav_(read|write)|\
+			(encode|decode)(_frame|_header)?|\
+			lms_(predict|update)|\
+			scale_(slice|sample)\
+			)"
+		)
 		.merge_extern_blocks(true)
 		.raw_line("#![allow(dead_code)]")
 		.generate()?

@@ -4,11 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["conv"]
+default = ["conv", "simd"]
 conv = ["dep:symphonia"]
+simd = []
 
 [dependencies]
 amplify_derive = "2.11.3"
+itertools = "0.10.5"
 symphonia = { version = "0.5.2", optional = true }
 
 [dev-dependencies]
