@@ -29,6 +29,8 @@
 )]
 #![cfg(feature = "simd")]
 #![feature(portable_simd)]
+#![cfg(test)]
+#![feature(test)]
 
 use std::cmp::min;
 use amplify_derive::{Display, Error};

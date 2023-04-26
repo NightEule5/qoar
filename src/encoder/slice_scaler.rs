@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use crate::{DEQUANT_TABLE, div, QoaLmsState, QUANT_TABLE, SLICE_LEN};
-use std::simd::SimdInt;
 
 #[cfg(feature = "simd")]
 pub use simd::VectorScaler;
@@ -70,11 +69,15 @@ impl SliceScaler for LinearScaler {
 
 #[cfg(test)]
 mod test {
+	extern crate test;
+
 	use quickcheck::{Arbitrary, Gen};
 	use quickcheck_macros::quickcheck;
 	use qoa_ref_sys::scale_slice;
 	use crate::encoder::slice_scaler::{LinearScaler, SliceScaler};
 	use crate::QoaLmsState;
+	use test::Bencher;
+	use qoa_ref_sys::qoa::qoa_lms_t;
 
 	#[quickcheck]
 	fn scale_sample(lms: QoaLmsState, sample: i16) {
@@ -90,7 +93,7 @@ mod test {
 	}
 
 	#[derive(Copy, Clone, Debug)]
-	pub(crate) struct Slice(pub [i16; 40]);
+	struct Slice(pub [i16; 40]);
 
 	impl Arbitrary for Slice {
 		fn arbitrary(g: &mut Gen) -> Self {
@@ -113,6 +116,98 @@ mod test {
 		assert_eq!(lin_lms[1], ref_lms[1].into(), "LMS state on channel 1");
 		assert_eq!(lin_slice2, ref_slice2, "Slice data on channel 1");
 	}
+
+	#[bench]
+	fn scale_bench(b: &mut Bencher) {
+		#[inline(never)]
+		fn scale_no_inline(samples: &[i16], mut lms: Vec<QoaLmsState>, channel_count: usize) -> Vec<u64> {
+			(0..channel_count).map(|chn|
+				LinearScaler::scale(samples, &mut lms[chn], chn, channel_count)
+			).collect()
+		}
+
+		let channel_count = 8;
+		let lms = vec![QoaLmsState::default(); channel_count];
+		let samples = [-8, 8, -16, 16, -32, 32, -64, 64, -128, 128].repeat(2 * channel_count);
+		b.iter(|| scale_no_inline(&samples, lms.clone(), channel_count))
+	}
+
+	#[bench]
+	fn reference_scale_bench(b: &mut Bencher) {
+		#[inline(never)]
+		fn scale_no_inline(samples: &[i16], mut lms: [qoa_lms_t; 8], channel_count: usize) -> Vec<u64> {
+			(0..channel_count).map(|chn|
+				scale_slice(samples, channel_count, &mut lms, chn)
+			).collect()
+		}
+
+		let channel_count = 8;
+		let lms = [QoaLmsState::default().into(); 8];
+		let samples = [-8, 8, -16, 16, -32, 32, -64, 64, -128, 128].repeat(2 * channel_count);
+		b.iter(|| scale_no_inline(&samples, lms.clone(), channel_count))
+	}
+
+	#[cfg(feature = "simd")]
+	mod simd {
+		extern crate test;
+
+		use std::simd::i32x16;
+		use quickcheck_macros::quickcheck;
+		use qoa_ref_sys::qoa::qoa_lms_t;
+		use qoa_ref_sys::scale_slice;
+		use crate::encoder::slice_scaler::{SliceScaler, VectorScaler};
+		use crate::encoder::slice_scaler::test::Slice;
+		use crate::QoaLmsState;
+		use crate::simd::LmsStateVector;
+		use test::Bencher;
+
+		#[quickcheck]
+		fn scale_sample(lms: QoaLmsState, sample: i16) {
+			let ref mut vector_lms = LmsStateVector::from(lms.clone());
+			let ref mut native_lms = vec![Into::<qoa_lms_t>::into(lms); 16];
+
+			let (vec_quant, vec_dequant, vec_reconst) =
+				VectorScaler::scale_sample(i32x16::splat(sample as i32), vector_lms);
+
+			for sf in 0..16 {
+				let ref mut lms = native_lms[sf];
+				let (quant, dequant, reconst) =
+					qoa_ref_sys::scale_sample(sample as i32, sf as i32, lms);
+				assert_eq!(vec_quant  [sf],   quant as i32,   "quantized residual for scale factor {sf}");
+				assert_eq!(vec_dequant[sf], dequant,        "dequantized residual for scale factor {sf}");
+				assert_eq!(vec_reconst[sf], reconst as i32, "reconstructed sample for scale factor {sf}");
+			}
+		}
+
+		#[quickcheck]
+		fn scale(Slice(ref slice): Slice, lms: QoaLmsState) {
+			let mut vec_lms = [lms; 2];
+			let mut ref_lms = [lms.into(); 8];
+			let vec_slice1 = VectorScaler::scale(slice, &mut vec_lms[0], 0, 2);
+			let vec_slice2 = VectorScaler::scale(slice, &mut vec_lms[1], 1, 2);
+			let ref_slice1 = scale_slice(slice, 1, &mut ref_lms, 0);
+			let ref_slice2 = scale_slice(slice, 2, &mut ref_lms, 1);
+			assert_eq!(vec_lms[0], ref_lms[0].into(), "LMS state on channel 0");
+			assert_eq!(vec_slice1, ref_slice1, "Slice data on channel 0");
+			assert_eq!(vec_lms[1], ref_lms[1].into(), "LMS state on channel 1");
+			assert_eq!(vec_slice2, ref_slice2, "Slice data on channel 1");
+		}
+
+		#[bench]
+		fn scale_bench(b: &mut Bencher) {
+			#[inline(never)]
+			fn scale_no_inline(samples: &[i16], mut lms: Vec<QoaLmsState>, channel_count: usize) -> Vec<u64> {
+				(0..channel_count).map(|chn|
+					VectorScaler::scale(samples, &mut lms[chn], chn, channel_count)
+				).collect()
+			}
+
+			let channel_count = 8;
+			let lms = vec![QoaLmsState::default(); channel_count];
+			let samples = [-8, 8, -16, 16, -32, 32, -64, 64, -128, 128].repeat(2 * channel_count);
+			b.iter(|| scale_no_inline(&samples, lms.clone(), channel_count))
+		}
+	}
 }
 
 #[cfg(feature = "simd")]
@@ -129,7 +224,7 @@ mod simd {
 	pub struct VectorScaler;
 
 	impl VectorScaler {
-		fn scale_sample(sample: i32x16, lms: &mut LmsStateVector) -> (i32x16, i32x16, i32x16) {
+		pub(super) fn scale_sample(sample: i32x16, lms: &mut LmsStateVector) -> (i32x16, i32x16, i32x16) {
 			const SCALED_MIN: i32x16 = const_splat(-8);
 			const SCALED_MAX: i32x16 = const_splat( 8);
 			const SAMPLE_MIN: i32x16 = const_splat(-32768);
@@ -188,50 +283,6 @@ mod simd {
 			let best_lane = cur_err.min_lane();
 			*lms = lms_vec.collapse(best_lane);
 			slice[best_lane]
-		}
-	}
-
-	#[cfg(test)]
-	mod test {
-		use std::simd::i32x16;
-		use quickcheck_macros::quickcheck;
-		use qoa_ref_sys::qoa::qoa_lms_t;
-		use qoa_ref_sys::scale_slice;
-		use crate::encoder::slice_scaler::{SliceScaler, VectorScaler};
-		use crate::encoder::slice_scaler::test::Slice;
-		use crate::QoaLmsState;
-		use crate::simd::LmsStateVector;
-
-		#[quickcheck]
-		fn scale_sample(lms: QoaLmsState, sample: i16) {
-			let ref mut vector_lms = LmsStateVector::from(lms.clone());
-			let ref mut native_lms = vec![Into::<qoa_lms_t>::into(lms); 16];
-
-			let (vec_quant, vec_dequant, vec_reconst) =
-				VectorScaler::scale_sample(i32x16::splat(sample as i32), vector_lms);
-
-			for sf in 0..16 {
-				let ref mut lms = native_lms[sf];
-				let (quant, dequant, reconst) =
-					qoa_ref_sys::scale_sample(sample as i32, sf as i32, lms);
-				assert_eq!(vec_quant  [sf],   quant as i32,   "quantized residual for scale factor {sf}");
-				assert_eq!(vec_dequant[sf], dequant,        "dequantized residual for scale factor {sf}");
-				assert_eq!(vec_reconst[sf], reconst as i32, "reconstructed sample for scale factor {sf}");
-			}
-		}
-
-		#[quickcheck]
-		fn scale(Slice(ref slice): Slice, lms: QoaLmsState) {
-			let mut vec_lms = [lms; 2];
-			let mut ref_lms = [lms.into(); 8];
-			let vec_slice1 = VectorScaler::scale(slice, &mut vec_lms[0], 0, 2);
-			let vec_slice2 = VectorScaler::scale(slice, &mut vec_lms[1], 1, 2);
-			let ref_slice1 = scale_slice(slice, 1, &mut ref_lms, 0);
-			let ref_slice2 = scale_slice(slice, 2, &mut ref_lms, 1);
-			assert_eq!(vec_lms[0], ref_lms[0].into(), "LMS state on channel 0");
-			assert_eq!(vec_slice1, ref_slice1, "Slice data on channel 0");
-			assert_eq!(vec_lms[1], ref_lms[1].into(), "LMS state on channel 1");
-			assert_eq!(vec_slice2, ref_slice2, "Slice data on channel 1");
 		}
 	}
 }
