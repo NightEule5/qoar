@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::{DEQUANT_TABLE, div, QoaLmsState, QUANT_TABLE, SLICE_LEN};
+use std::simd::SimdInt;
 
 #[cfg(feature = "simd")]
 pub use simd::VectorScaler;
@@ -116,9 +117,10 @@ mod test {
 
 #[cfg(feature = "simd")]
 mod simd {
-	use std::simd::{i32x16, i32x4, i64x8, LaneCount, Simd, SimdElement, SimdInt, SupportedLaneCount, u64x8};
+	use std::simd::{i32x16, SimdInt, SimdOrd, SimdUint, u8x16};
 	use crate::encoder::slice_scaler::SliceScaler;
-	use crate::{DEQUANT_TABLE, QoaLmsState, QUANT_TABLE, SLICE_LEN, vec_div};
+	use crate::{DEQUANT_TABLE, QoaLmsState, QUANT_TABLE, SLICE_LEN};
+	use crate::simd::{const_splat, div, i64x16, LmsStateVector, SimdLanes, u64x16};
 
 	/// A SIMD vector scaler. Computes the slice for each scale factor as a vector
 	/// element, then chooses the scaled slice with the smallest error. Should be
@@ -127,67 +129,44 @@ mod simd {
 	pub struct VectorScaler;
 
 	impl VectorScaler {
-		fn split<const N: usize, T: SimdElement>(v: Simd<T, N>) -> (Simd<T, { N / 2 }>, Simd<T, { N / 2 }>)
-																where LaneCount<N>: SupportedLaneCount,
-																	  LaneCount<{ N / 2 }>: SupportedLaneCount {
-			let v = v.to_array();
-			let (lo, hi) = v.split_at(N / 2);
-			(Simd::from_slice(lo), Simd::from_slice(hi))
-		}
-
-		fn join_into_array<const N: usize, T: SimdElement + Default>(
-			lo: Simd<T, N>,
-			hi: Simd<T, N>
-		) -> [T; N * 2] where LaneCount<N>: SupportedLaneCount {
-			let mut array = [T::default(); N * 2];
-			array[..8].copy_from_slice(lo.as_array());
-			array[8..].copy_from_slice(hi.as_array());
-			array
-		}
-
 		fn scale_sample(sample: i32x16, lms: &mut LmsStateVector) -> (i32x16, i32x16, i32x16) {
+			const SCALED_MIN: i32x16 = const_splat(-8);
+			const SCALED_MAX: i32x16 = const_splat( 8);
+			const SAMPLE_MIN: i32x16 = const_splat(-32768);
+			const SAMPLE_MAX: i32x16 = const_splat( 32767);
+
 			let prediction = lms.predict();
 			let residual = sample - prediction;
-			let scaled = vec_div(residual);
-			let clamped = scaled.clamp(
-				i32x16::splat(-8),
-				i32x16::splat( 8)
-			);
-			let quantized = {
-				let mut q = clamped + i32x16::splat(8);
-				for i in 0..16 {
-					q[i] = QUANT_TABLE[q[i] as usize] as i32;
+			let scaled = div(residual);
+			let clamped = scaled.simd_clamp(SCALED_MIN, SCALED_MAX) + SCALED_MAX;
+			let quantized: i32x16 = u8x16::gather_or_default(
+				&QUANT_TABLE,
+				clamped.cast()
+			).cast();
+			let dequantized = {
+				let mut q = i32x16::splat(0);
+				for sf in 0..16 {
+					q[sf] = DEQUANT_TABLE[sf][quantized[sf] as usize]
 				}
 				q
 			};
-			let dequantized = {
-				let mut dq = quantized;
-				for i in 0..16 {
-					dq[i] = DEQUANT_TABLE[i][dq[i] as usize];
-				}
-				dq
-			};
-			let reconst = (prediction + dequantized).clamp(
-				i32x16::splat(-32768),
-				i32x16::splat( 32767)
-			);
+			let reconst = (prediction + dequantized).simd_clamp(SAMPLE_MIN, SAMPLE_MAX);
 			(quantized, dequantized, reconst)
 		}
 	}
 
 	impl SliceScaler for VectorScaler {
 		fn scale(samples: &[i16], lms: &mut QoaLmsState, chn: usize, channel_count: usize) -> u64 {
+			const SFS: u64x16 = u64x16::from_array(
+				[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+			);
 			let len = SLICE_LEN.clamp(0, samples.len());
 			let rng = chn..len * channel_count + chn;
 
 			// Create an LMS State vector for all 16 scale factors.
 			let mut lms_vec = LmsStateVector::from(*lms);
-
-			let mut cur_err1 = u64x8::splat(0);
-			let mut cur_err2 = u64x8::splat(0);
-
-			let mut slice1 = u64x8::from_array([0, 1,  2,  3,  4,  5,  6,  7]);
-			let mut slice2 = u64x8::from_array([8, 9, 10, 11, 12, 13, 14, 15]);
+			let mut cur_err = u64x16::splat(0);
+			let mut slice = SFS;
 
 			// Compute the scaled slice and error for all scale factors, then pick
 			// the slice with the lowest error.
@@ -197,79 +176,18 @@ mod simd {
 				let (quantized, dequantized, reconst) =
 					Self::scale_sample(sample, &mut lms_vec);
 
-				// Compute the error, split, square, and add to the error sum.
-				let error = (sample - reconst).cast();
-				let (error1, error2): (i64x8, _) = Self::split(error);
-				cur_err1 += (error1 * error1).cast();
-				cur_err2 += (error2 * error2).cast();
+				// Compute the error, square, and add to the error sum.
+				let error: i64x16 = (sample - reconst).cast();
+				cur_err += (error * error).cast();
 
 				lms_vec.update(reconst, dequantized);
-				let (qr1, qr2) = Self::split(quantized);
-				slice1 = slice1 << u64x8::splat(3) | qr1.cast();
-				slice2 = slice2 << u64x8::splat(3) | qr2.cast();
+				slice = slice << u64x16::splat(3) | quantized.cast();
 			}
 
 			// Return the slice with the minimum error and assign its LMS.
-			let errors = Self::join_into_array(cur_err1, cur_err2);
-			let slices = Self::join_into_array(slice1, slice2);
-			let best_i = errors.iter().enumerate().min_by_key(|(_, e)| *e).unwrap().0;
-			*lms = lms_vec.collapse(best_i);
-			slices[best_i]
-		}
-	}
-
-	#[derive(Copy, Clone)]
-	struct LmsStateVector {
-		history: [i32x4; 16],
-		weights: [i32x4; 16]
-	}
-
-	impl LmsStateVector {
-		fn predict(&self) -> i32x16 {
-			let Self { history, weights } = self;
-			let mut prediction = [0; 16];
-			for i in 0..16 {
-				prediction[i] = (history[i] * weights[i]).reduce_sum() >> 13;
-			}
-
-			i32x16::from_array(prediction)
-		}
-
-		fn update(&mut self, samples: i32x16, residual: i32x16) {
-			let Self { history, weights } = self;
-
-			for lms in 0..16 {
-				let history = &mut history[lms];
-				let weights = &mut weights[lms];
-				let sample = samples[lms];
-				let delta = residual[lms] >> 4;
-				for i in 0..4 {
-					weights[i] += if history[i] < 0 {
-						-delta
-					} else {
-						delta
-					};
-				}
-
-				*history = history.rotate_lanes_left::<1>();
-				history[3] = sample as i32;
-			}
-		}
-
-		fn collapse(self, sf: usize) -> QoaLmsState {
-			QoaLmsState {
-				history: self.history[sf].to_array(),
-				weights: self.weights[sf].to_array(),
-			}
-		}
-	}
-
-	impl From<QoaLmsState> for LmsStateVector {
-		fn from(QoaLmsState { history, weights }: QoaLmsState) -> Self {
-			Self {
-				history: [i32x4::from_array(history); 16],
-				weights: [i32x4::from_array(weights); 16]
-			}
+			let best_lane = cur_err.min_lane();
+			*lms = lms_vec.collapse(best_lane);
+			slice[best_lane]
 		}
 	}
 
@@ -280,9 +198,9 @@ mod simd {
 		use qoa_ref_sys::qoa::qoa_lms_t;
 		use qoa_ref_sys::scale_slice;
 		use crate::encoder::slice_scaler::{SliceScaler, VectorScaler};
-		use crate::encoder::slice_scaler::simd::LmsStateVector;
 		use crate::encoder::slice_scaler::test::Slice;
 		use crate::QoaLmsState;
+		use crate::simd::LmsStateVector;
 
 		#[quickcheck]
 		fn scale_sample(lms: QoaLmsState, sample: i16) {

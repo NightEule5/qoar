@@ -28,7 +28,7 @@
 	specialization,
 )]
 #![cfg(feature = "simd")]
-#![feature(portable_simd, const_slice_split_at_not_mut)]
+#![feature(portable_simd)]
 
 use std::cmp::min;
 use amplify_derive::{Display, Error};
@@ -44,6 +44,7 @@ mod encoder;
 mod decoder;
 pub mod io;
 mod util;
+mod simd;
 
 #[derive(Copy, Clone, Debug, Display, Error)]
 pub enum DescriptorError {
@@ -214,7 +215,7 @@ static SF_TABLE: [i32; 16] = [
 	1, 7, 21, 45, 84, 138, 211, 304, 421, 562, 731, 928, 1157, 1419, 1715, 2048
 ];
 
-static RECIP_TABLE: [i32; 16] = [
+const RECIP_TABLE: [i64; 16] = [
 	65536, 9363, 3121, 1457, 781, 475, 311, 216, 156, 117, 90, 71, 57, 47, 39, 32
 ];
 
@@ -239,15 +240,13 @@ static DEQUANT_TABLE: [[i32; 8]; 16] = [
 
 impl QoaLmsState {
 	fn predict(&self) -> i32 {
-		let history = self.history.iter().map(|h| *h as i64);
-		let weights = self.weights.iter().map(|w| *w as i64);
-		let p: i64 = history.zip(weights).map(|(h, w)| h * w).sum();
-		debug_assert!((i32::min_value() as i64..=i32::max_value() as i64).contains(&(p >> 13)));
-		(p >> 13) as i32
+		let history = self.history.iter().cloned();
+		let weights = self.weights.iter().cloned();
+		let p: i32 = history.zip(weights).map(|(h, w)| h * w).sum();
+		p >> 13
 	}
 
 	fn update(&mut self, sample: i16, residual: i32) {
-		debug_assert!((-32678..=32767).contains(&(residual >> 4)));
 		let delta = residual >> 4;
 		for (history, weight) in self.history
 									 .into_iter()
@@ -271,71 +270,60 @@ impl Default for QoaLmsState {
 
 fn div(v: i32, sf: usize) -> i32 {
 	let recip = RECIP_TABLE[sf];
-	let mut n = ((v as i64 * recip as i64 + (1 << 15)) >> 16) as i32;
+	let mut n = ((v as i64 * recip + (1 << 15)) >> 16) as i32;
 	n += ((v > 0) as i32 - (v < 0) as i32) -
 		 ((n > 0) as i32 - (n < 0) as i32);
 	n
 }
 
-#[cfg(feature = "simd")]
-fn vec_div(v: std::simd::i32x16) -> std::simd::i32x16 {
-	use std::simd::{i32x8, i32x16, i64x8, SimdPartialOrd};
-
-	// Split the value and reciprocal array into two i64x8 vectors.
-	let (r1, r2) = RECIP_TABLE.split_at(8);
-	let r1: i64x8 = i32x8::from_slice(r1).cast();
-	let r2: i64x8 = i32x8::from_slice(r2).cast();
-	let (v1, v2) = v.as_array().split_at(8);
-	let v1: i64x8 = i32x8::from_slice(v1).cast();
-	let v2: i64x8 = i32x8::from_slice(v2).cast();
-
-	// Multiply, add, and shift the vectors as in div above, then recombine into an
-	// i32x16 vector.
-	let add = i64x8::splat(1 << 15);
-	let shr = i64x8::splat(16);
-	let n1: i32x8 = ((v1 * r1 + add) >> shr).cast();
-	let n2: i32x8 = ((v2 * r2 + add) >> shr).cast();
-	let n = {
-		let mut n = [0; 16];
-		n[..8].copy_from_slice(n1.as_array());
-		n[8..].copy_from_slice(n2.as_array());
-		i32x16::from_array(n)
-	};
-
-	fn diff(v: i32x16, zero: i32x16, one: i32x16) -> i32x16 {
-		
-		// true = 1, false = 0
-		let gt = v.simd_gt(zero).select(one, zero);
-		let lt = v.simd_lt(zero).select(one, zero);
-		gt - lt
-	}
-	let zero = i32x16::splat(0);
-	let one  = i32x16::splat(1);
-	n + diff(v, zero, one) -
-		diff(n, zero, one)
-}
-
 #[cfg(test)]
 mod test {
-	use std::simd::i32x16;
+	use std::fmt::{Arguments, Debug};
 	use quickcheck_macros::quickcheck;
 	use quickcheck::{Arbitrary, Gen, TestResult};
 	use qoa_ref_sys::qoa::qoa_lms_t;
 	use crate::decoder::QoaSource;
 	use crate::encoder::QoaSink;
 	use crate::io::Buffer;
-	use crate::{DEQUANT_TABLE, div, QoaLmsState};
+	use crate::{DEQUANT_TABLE, QoaLmsState};
 
+	#[macro_export]
 	macro_rules! qc_assert_eq {
-	    ($l:expr,$r:expr) => {
-			if $l == $r {
+		($left:expr,$right:expr) => {{
+			let left = $left;
+			let right = $right;
+			if left == right {
 				TestResult::passed()
 			} else {
 				TestResult::error(
-					format!("Assertion failed:\nLeft -> {:?}\nRight -> {:?}\n", $l, $r)
+					crate::test::format_qc_assert_error(&left, &right, None)
 				)
 			}
-		};
+		}};
+		($left:expr,$right:expr,$($arg:tt)+) => {{
+			let left = $left;
+			let right = $right;
+			if left == right {
+				TestResult::passed()
+			} else {
+				TestResult::error(
+					crate::test::format_qc_assert_error(&left, &right, Some(format_args!($($arg)+)))
+				)
+			}
+		}};
+	}
+
+	pub fn format_qc_assert_error<L: Debug, R: Debug>(left: &L, right: &R, msg: Option<Arguments>) -> String {
+		let msg = msg.map(|msg| {
+			let mut msg = msg.to_string();
+			msg.insert(0, ' ');
+			msg
+		}).unwrap_or_default();
+
+		format!(
+			"assertion failed `(left == right)`:{msg}\n \
+			left: `{left:?}`,\nright: `{right:?}`",
+		)
 	}
 
 	impl Arbitrary for QoaLmsState {
@@ -387,27 +375,6 @@ mod test {
 		qc_assert_eq!(lms, other)
 	}
 
-	#[derive(Copy, Clone, Debug)]
-	struct ArbArray<T: Arbitrary, const N: usize>([T; N]);
-
-	impl<T: Arbitrary + Copy + Default, const N: usize> Arbitrary for ArbArray<T, N> {
-		fn arbitrary(g: &mut Gen) -> Self {
-			let mut arr = [T::default(); N];
-			arr.fill_with(|| T::arbitrary(g));
-			Self(arr)
-		}
-	}
-
-	#[cfg(feature = "simd")]
-	#[quickcheck]
-	fn vec_div(ArbArray(values): ArbArray<i32, 16>) {
-		let vec = crate::vec_div(i32x16::from_array(*&values)).to_array().to_vec();
-		let lin = values.into_iter().enumerate().map(|(i, v)| div(v, i)).collect::<Vec<_>>();
-
-		println!("vec_div -> {vec:?}");
-		assert_eq!(vec, lin)
-	}
-
 	#[quickcheck]
 	fn codec_file_header(sample_count: u32) -> TestResult {
 		let mut buf = Buffer::default();
@@ -417,7 +384,7 @@ mod test {
 
 		match buf.dec_file_header() {
 			Ok(samples) => qc_assert_eq!(samples, sample_count),
-			Err(error)  => TestResult::error(format!("{error}"))
+			Err(error) => TestResult::error(format!("{error}"))
 		}
 	}
 
